@@ -81,6 +81,10 @@ pub fn run_editor(options: EditorOptions) -> Result<()> {
                             button: MouseButton::Right,
                             ..
                         } => editor.input(event, false),
+                        event @ WindowEvent::MouseInput {
+                            button: MouseButton::Left,
+                            ..
+                        } => editor.input(event, !egui_response.consumed),
                         event if !egui_response.consumed => editor.input(event, true),
                         _ => {}
                     }
@@ -126,6 +130,7 @@ fn editor_source_map(options: &EditorOptions) -> Result<(SourceMap, usize)> {
 const WINDOW_TITLE: &str = concat!("Geodata Editor By Mk — v", env!("CARGO_PKG_VERSION"));
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const MOUSE_LOOK_SENSITIVITY: f32 = 0.002;
+const MOUSE_ELEVATION_SENSITIVITY: f32 = 0.0012;
 // Keyboard navigation is intentionally precise; hold Shift to return to the
 // original full traversal speed for moving across an entire map.
 const NORMAL_MOVE_SPEED: f32 = 0.08;
@@ -413,6 +418,7 @@ struct EditorUi {
     selection: Vec<LayerAddress>,
     rectangle_start: Option<LayerAddress>,
     line_start: Option<LayerAddress>,
+    pending_plain_selection: bool,
     visible_layer: usize,
     brush_radius: usize,
     visual_stride: usize,
@@ -691,7 +697,36 @@ impl EditorView {
                 }
             }
         }
-        if canvas_input && self.loaded && self.has_context {
+        if matches!(
+            &event,
+            WindowEvent::MouseInput {
+                button: MouseButton::Right,
+                state: ElementState::Pressed,
+                ..
+            }
+        ) && self.preview.input.left_pressed
+        {
+            self.ui.pending_plain_selection = false;
+            self.ui.rectangle_start = None;
+        }
+        if !canvas_input
+            && matches!(
+                &event,
+                WindowEvent::MouseInput {
+                    button: MouseButton::Left,
+                    state: ElementState::Released,
+                    ..
+                }
+            )
+        {
+            self.ui.pending_plain_selection = false;
+            self.ui.rectangle_start = None;
+        }
+        if canvas_input
+            && self.loaded
+            && self.has_context
+            && !self.preview.input.uses_left_for_vertical_navigation()
+        {
             if let WindowEvent::MouseInput {
                 button: MouseButton::Left,
                 state,
@@ -704,6 +739,7 @@ impl EditorView {
                     || self.preview.input.pressed.contains(&KeyCode::ControlRight);
                 match state {
                     ElementState::Pressed if ctrl => {
+                        self.ui.pending_plain_selection = false;
                         if let Some(cell) = self.pick() {
                             self.select_line_endpoint(cell);
                         } else {
@@ -711,25 +747,20 @@ impl EditorView {
                         }
                     }
                     ElementState::Pressed if shift => {
+                        self.ui.pending_plain_selection = false;
                         self.ui.line_start = None;
                         self.ui.rectangle_start = self.pick();
                     }
                     ElementState::Pressed => {
-                        if let Some(cell) = self.pick() {
-                            self.ui.line_start = None;
-                            self.ui.selected = cell;
-                            self.ui.visible_layer = cell.layer;
-                            self.ui.selection.clear();
-                            self.refresh_editor_meshes();
-                            self.ui.status = format!(
-                                "Célula selecionada: Geo {},{} | camada {}.",
-                                cell.x, cell.y, cell.layer
-                            );
-                        } else {
-                            self.ui.status = "Nenhuma célula L2J foi atingida. Aponte a câmera para a superfície e tente novamente.".into();
-                        }
+                        // Resolve a normal click on release. If the right
+                        // button joins first, the pending selection is
+                        // cancelled and the same drag becomes vertical camera
+                        // navigation without changing the edited cell.
+                        self.ui.pending_plain_selection = true;
                     }
                     ElementState::Released => {
+                        let pending_plain_selection =
+                            std::mem::take(&mut self.ui.pending_plain_selection);
                         if let (Some(start), Some(end)) =
                             (self.ui.rectangle_start.take(), self.pick())
                         {
@@ -737,6 +768,20 @@ impl EditorView {
                                 self.toggle_selection(end);
                             } else {
                                 self.select_rectangle(start, end);
+                            }
+                        } else if pending_plain_selection {
+                            if let Some(cell) = self.pick() {
+                                self.ui.line_start = None;
+                                self.ui.selected = cell;
+                                self.ui.visible_layer = cell.layer;
+                                self.ui.selection.clear();
+                                self.refresh_editor_meshes();
+                                self.ui.status = format!(
+                                    "Célula selecionada: Geo {},{} | camada {}.",
+                                    cell.x, cell.y, cell.layer
+                                );
+                            } else {
+                                self.ui.status = "Nenhuma célula L2J foi atingida. Aponte a câmera para a superfície e tente novamente.".into();
                             }
                         }
                     }
@@ -1350,6 +1395,7 @@ impl EditorView {
         if self.ui.hide_fully_open_blocks {
             ui.small("Somente células com algum bloqueio permanecem visíveis.");
         }
+        ui.small("Mouse direito: olhar · esquerdo + direito: subir/descer.");
         ui.add_space(4.0);
         ui.label(format!(
             "{} blocos alterados",
@@ -3217,6 +3263,9 @@ struct CameraInput {
     rotating: bool,
     raw_mouse: bool,
     cursor: Option<PhysicalPosition<f64>>,
+    left_pressed: bool,
+    right_pressed: bool,
+    dual_button_navigation: bool,
 }
 
 impl CameraInput {
@@ -3243,7 +3292,9 @@ impl CameraInput {
                 state,
                 ..
             } => {
-                if *state == ElementState::Pressed {
+                self.right_pressed = *state == ElementState::Pressed;
+                self.update_dual_button_navigation();
+                if self.right_pressed {
                     self.rotating = true;
                     self.raw_mouse = capture_cursor(window);
                 } else {
@@ -3251,10 +3302,28 @@ impl CameraInput {
                 }
                 self.cursor = None;
             }
-            WindowEvent::Focused(false) => self.stop_rotating(window),
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state,
+                ..
+            } => {
+                self.left_pressed = *state == ElementState::Pressed;
+                self.update_dual_button_navigation();
+                self.cursor = None;
+            }
+            WindowEvent::Focused(false) => {
+                self.left_pressed = false;
+                self.right_pressed = false;
+                self.dual_button_navigation = false;
+                self.stop_rotating(window);
+            }
             WindowEvent::CursorMoved { position, .. } if self.rotating && !self.raw_mouse => {
                 if let Some(previous) = self.cursor.replace(*position) {
-                    rotate_camera(camera, position.x - previous.x, position.y - previous.y);
+                    self.apply_mouse_motion(
+                        camera,
+                        position.x - previous.x,
+                        position.y - previous.y,
+                    );
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -3276,7 +3345,27 @@ impl CameraInput {
             return;
         }
         if let DeviceEvent::MouseMotion { delta } = event {
-            rotate_camera(camera, delta.0, delta.1);
+            self.apply_mouse_motion(camera, delta.0, delta.1);
+        }
+    }
+
+    fn update_dual_button_navigation(&mut self) {
+        if self.left_pressed && self.right_pressed {
+            self.dual_button_navigation = true;
+        } else if !self.left_pressed && !self.right_pressed {
+            self.dual_button_navigation = false;
+        }
+    }
+
+    fn uses_left_for_vertical_navigation(&self) -> bool {
+        self.right_pressed || self.dual_button_navigation
+    }
+
+    fn apply_mouse_motion(&self, camera: &mut Camera, delta_x: f64, delta_y: f64) {
+        if self.left_pressed && self.right_pressed {
+            elevate_camera(camera, delta_y);
+        } else {
+            rotate_camera(camera, delta_x, delta_y);
         }
     }
 
@@ -3329,6 +3418,10 @@ fn capture_cursor(window: &Window) -> bool {
 fn rotate_camera(camera: &mut Camera, delta_x: f64, delta_y: f64) {
     camera.yaw -= delta_x as f32 * MOUSE_LOOK_SENSITIVITY;
     camera.pitch = (camera.pitch - delta_y as f32 * MOUSE_LOOK_SENSITIVITY).clamp(-1.52, 1.52);
+}
+
+fn elevate_camera(camera: &mut Camera, delta_y: f64) {
+    camera.position[1] -= delta_y as f32 * camera.speed * MOUSE_ELEVATION_SENSITIVITY;
 }
 
 fn create_pipelines(
@@ -4336,6 +4429,46 @@ mod tests {
 
         rotate_camera(&mut camera, 100.0, -50.0);
 
+        assert!((camera.yaw + 0.2).abs() < f32::EPSILON);
+        assert!((camera.pitch - 0.1).abs() < f32::EPSILON);
+    }
+    #[test]
+    fn dual_mouse_drag_moves_vertically_without_rotating() {
+        let input = CameraInput {
+            left_pressed: true,
+            right_pressed: true,
+            ..Default::default()
+        };
+        let mut camera = Camera {
+            position: [0.0, 25.0, 0.0],
+            yaw: 0.4,
+            pitch: -0.3,
+            speed: 100.0,
+        };
+
+        input.apply_mouse_motion(&mut camera, 80.0, -50.0);
+
+        assert_eq!(camera.position[1], 31.0);
+        assert_eq!(camera.yaw, 0.4);
+        assert_eq!(camera.pitch, -0.3);
+    }
+
+    #[test]
+    fn right_mouse_drag_still_rotates_the_camera() {
+        let input = CameraInput {
+            right_pressed: true,
+            ..Default::default()
+        };
+        let mut camera = Camera {
+            position: [0.0, 25.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            speed: 100.0,
+        };
+
+        input.apply_mouse_motion(&mut camera, 100.0, -50.0);
+
+        assert_eq!(camera.position[1], 25.0);
         assert!((camera.yaw + 0.2).abs() < f32::EPSILON);
         assert!((camera.pitch - 0.1).abs() < f32::EPSILON);
     }
