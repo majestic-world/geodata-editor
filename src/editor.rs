@@ -120,6 +120,9 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
         return Ok(());
     }
     let options = parse(arguments)?;
+    if crate::update::check_and_apply() {
+        return Ok(());
+    }
     editor_view::run_editor(options)
 }
 

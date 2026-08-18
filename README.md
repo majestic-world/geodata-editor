@@ -12,6 +12,18 @@ make editor
 O executável público será criado em `dist\GeodataEditor.exe`. O perfil de
 release usa LTO e remove símbolos de depuração antes da cópia.
 
+## Atualização automática
+
+Ao iniciar, o editor consulta a última release publicada no GitHub. Uma versão
+mais nova precisa disponibilizar o asset `GeodataEditor.exe`. Quando encontrada,
+uma janela nativa pergunta se a atualização deve ser instalada. O asset precisa
+ter o digest SHA-256 publicado pela API do GitHub; o download é descartado se
+o tamanho ou o digest não coincidirem.
+
+Depois da confirmação, o editor baixa o asset, encerra, renomeia a versão em
+uso para `GeodataEditor.exe.old`, ativa o novo executável e o reinicia. Falhas
+de rede, API ou download não mostram erro e o editor abre normalmente.
+
 ## Licença
 
 Este projeto é licenciado sob a **GNU General Public License, versão 3 ou

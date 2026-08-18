@@ -1,6 +1,6 @@
 [package]
 name = "geodata-editor"
-version = "0.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Standalone Lineage II L2J geodata editor"
@@ -27,6 +27,11 @@ png = "0.18.1"
 pollster = "0.3"
 rfd = "0.16"
 wgpu = "0.19"
+semver = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+ureq = "2.12"
 winit = "0.29"
 
 [build-dependencies]

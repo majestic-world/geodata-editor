@@ -46,7 +46,6 @@ pub fn run_editor(options: EditorOptions) -> Result<()> {
         options,
         memory,
     ))?;
-    println!("Opening GeodataEditor. Close the window to return to the terminal.");
     event_loop
         .run(move |event, target| {
             target.set_control_flow(ControlFlow::Poll);
@@ -75,9 +74,7 @@ pub fn run_editor(options: EditorOptions) -> Result<()> {
                                     editor.preview.resize(editor.preview.size)
                                 }
                                 Err(wgpu::SurfaceError::OutOfMemory) => target.exit(),
-                                Err(wgpu::SurfaceError::Timeout) => {
-                                    eprintln!("warning: editor frame timed out")
-                                }
+                                Err(wgpu::SurfaceError::Timeout) => {}
                             }
                         }
                         event @ WindowEvent::MouseInput {
@@ -98,11 +95,9 @@ pub fn run_editor(options: EditorOptions) -> Result<()> {
 
 fn editor_source_map(options: &EditorOptions) -> Result<(SourceMap, usize)> {
     if let (Some(root), Some(map)) = (&options.client_root, &options.map) {
-        println!("Loading map context: {map}");
         let loader = PackageLoader::new(root.clone(), 0, false);
         let source = loader.load_map(map)?;
         let count = loader.loaded_package_count();
-        println!("{count} packages loaded for context.");
         return Ok((source, count));
     }
     let name = options
@@ -128,7 +123,7 @@ fn editor_source_map(options: &EditorOptions) -> Result<(SourceMap, usize)> {
     ))
 }
 
-const WINDOW_TITLE: &str = "Geodata Editor";
+const WINDOW_TITLE: &str = concat!("Geodata Editor By Mk — v", env!("CARGO_PKG_VERSION"));
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const MOUSE_LOOK_SENSITIVITY: f32 = 0.002;
 // Keyboard navigation is intentionally precise; hold Shift to return to the
@@ -561,7 +556,6 @@ impl EditorView {
         memory: EditorMemory,
     ) -> Result<Self> {
         let preview = Preview::new(event_loop, source_map).await?;
-        preview.window.set_title("Geodata Editor By Mk - v1.1");
         configure_editor_theme(&preview.egui_context);
         let mut ui = EditorUi {
             open_path: options
