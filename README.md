@@ -6,7 +6,7 @@ Editor nativo para arquivos de geodata Lineage II (`.l2j`, `.l2g` e
 ## Distribuição Windows
 
 ```powershell
-make editor
+make build
 ```
 
 O executável público será criado em `dist\GeodataEditor.exe`. O perfil de
