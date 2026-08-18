@@ -584,7 +584,7 @@ impl EditorView {
                 .unwrap_or(memory.client_root),
             map_name: options.map.clone().unwrap_or(memory.map_name),
             brush_radius: 1,
-            visual_stride: 2,
+            visual_stride: 1,
             show_nswe_icons: true,
             open_context_radius: 16,
             ..Default::default()
