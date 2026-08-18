@@ -491,7 +491,7 @@ fn load_nswe_icons(context: &egui::Context) -> [egui::TextureHandle; 16] {
         context.load_texture(
             format!("geodata-editor-nswe-{mask}"),
             pixels,
-            egui::TextureOptions::NEAREST,
+            egui::TextureOptions::LINEAR,
         )
     })
 }
@@ -811,6 +811,15 @@ impl EditorView {
                     &self.preview.camera_bind_group,
                     false,
                 );
+                // Selection changes the cell surface itself. Render the NSWE
+                // glyph afterwards so its directional state stays crisp.
+                draw_geodata(
+                    &mut pass,
+                    &self.preview.geodata_selection_pipeline,
+                    &self.selection_mesh,
+                    &self.preview.camera_bind_group,
+                    false,
+                );
                 if self.ui.show_nswe_icons {
                     draw_nswe_icons(
                         &mut pass,
@@ -820,15 +829,6 @@ impl EditorView {
                         &self.preview.nswe_icon_bind_group,
                     );
                 }
-                // Draw a broad, two-tone border in the cell plane. The center
-                // remains transparent, preserving both colour and NSWE glyph.
-                draw_geodata(
-                    &mut pass,
-                    &self.preview.geodata_selection_pipeline,
-                    &self.selection_mesh,
-                    &self.preview.camera_bind_group,
-                    false,
-                );
             }
             if self.preview.ui.wireframe {
                 if self.has_context {
@@ -2415,11 +2415,17 @@ fn editor_nswe_icon_instances(
             let start_x = block_x * 8;
             let start_y = block_y * 8;
             match document.block_type(block_x, block_y) {
-                // A simple block is semantically an 8×8 area with all four
-                // directions open.  Its cyan surface is already the status
-                // indicator; stretching a 32 px glyph across 128 world units
-                // only produces a large, pixelated label.
-                Some(EditableBlockType::Simple) => {}
+                // Simple is one authored 8×8 surface, so it receives one
+                // equally unified glyph instead of 64 repeated cell icons.
+                Some(EditableBlockType::Simple) => {
+                    if visibility.shows_layer(0) && visibility.shows_open_block(start_x, start_y) {
+                        if let Some(layer) = document.cell(LayerAddress::new(start_x, start_y, 0)) {
+                            append_editor_nswe_icon(
+                                &mut mesh, map, origin, start_x, start_y, layer, 63.4,
+                            );
+                        }
+                    }
+                }
                 Some(EditableBlockType::Complex | EditableBlockType::Multilayer) => {
                     let sampled_scale = 8.0 * stride as f32 - 0.6;
                     for local_x in 0..8 {
@@ -2482,10 +2488,13 @@ fn append_editor_nswe_icon(
             cell.height as f32 - origin.y + 2.5,
             map.bounds.min.z + y as f32 * 16.0 + cell_scale - origin.z,
         ],
-        // Legacy glyphs are 32×32 pixels.  Keep them near one L2J cell wide
-        // instead of stretching the bitmap over a sampled group of cells.
-        // This also keeps the scene readable when the user zooms in.
-        scale: (cell_scale * 0.80).min(7.4),
+        // The 256 px glyph remains sharp when enlarged over a Simple block.
+        // Complex cells use almost their full surface for legibility at zoom.
+        scale: if cell_scale > 8.0 {
+            cell_scale * 0.78
+        } else {
+            cell_scale * 0.92
+        },
         mask: (cell.nswe & 0x0f) as f32,
     });
 }
@@ -3470,7 +3479,7 @@ fn create_nswe_icon_resources(
     camera_layout: &wgpu::BindGroupLayout,
     format: wgpu::TextureFormat,
 ) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
-    const ICON_SIDE: u32 = 32;
+    const ICON_SIDE: u32 = 256;
     const ATLAS_SIDE: u32 = ICON_SIDE * 4;
     let pixels = nswe_icon_atlas();
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -3603,12 +3612,12 @@ fn create_nswe_icon_resources(
 }
 
 fn nswe_icon_atlas() -> Vec<u8> {
-    const ICON_SIDE: usize = 32;
+    const ICON_SIDE: usize = 256;
     const ATLAS_SIDE: usize = ICON_SIDE * 4;
     let mut atlas = vec![0; ATLAS_SIDE * ATLAS_SIDE * 4];
     for mask in 0..16_usize {
         let (size, icon) = decode_nswe_icon_rgba(nswe_icon_bytes(mask as u8));
-        assert_eq!(size, [ICON_SIDE, ICON_SIDE], "NSWE icon must be 32×32");
+        assert_eq!(size, [ICON_SIDE, ICON_SIDE], "NSWE icon must be 256×256");
         let origin_x = (mask % 4) * ICON_SIDE;
         let origin_y = (mask / 4) * ICON_SIDE;
         for row in 0..ICON_SIDE {
@@ -3824,13 +3833,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 @fragment
 fn fs_selection(input: VertexOutput) -> @location(0) vec4<f32> {
     let edge_distance = (1.0 - max(abs(input.offset.x), abs(input.offset.y))) * input.scale;
-    if edge_distance > 2.0 {
-        discard;
-    }
     let black = vec3<f32>(0.015, 0.015, 0.015);
     let yellow = srgb_to_linear(input.color.rgb);
-    let is_yellow = edge_distance >= 0.35 && edge_distance <= 1.65;
-    return vec4<f32>(select(black, yellow, is_yellow), 1.0);
+    let is_border = edge_distance <= 0.45;
+    let color = select(yellow, black, is_border);
+    let alpha = select(0.94, 1.0, is_border);
+    return vec4<f32>(color, alpha);
 }
 
 fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
@@ -3935,13 +3943,13 @@ mod tests {
     #[test]
     fn nswe_icon_atlas_contains_all_sixteen_status_glyphs() {
         let atlas = nswe_icon_atlas();
-        assert_eq!(atlas.len(), 128 * 128 * 4);
+        assert_eq!(atlas.len(), 1024 * 1024 * 4);
         for mask in 0..16_usize {
-            let origin_x = (mask % 4) * 32;
-            let origin_y = (mask / 4) * 32;
-            let contains_opaque_pixel = (0..32).any(|row| {
-                (0..32)
-                    .any(|column| atlas[((origin_y + row) * 128 + origin_x + column) * 4 + 3] > 0)
+            let origin_x = (mask % 4) * 256;
+            let origin_y = (mask / 4) * 256;
+            let contains_opaque_pixel = (0..256).any(|row| {
+                (0..256)
+                    .any(|column| atlas[((origin_y + row) * 1024 + origin_x + column) * 4 + 3] > 0)
             });
             assert!(contains_opaque_pixel, "mask {mask} has no visible glyph");
         }
