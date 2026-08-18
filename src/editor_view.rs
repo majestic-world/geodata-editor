@@ -561,7 +561,7 @@ impl EditorView {
         memory: EditorMemory,
     ) -> Result<Self> {
         let preview = Preview::new(event_loop, source_map).await?;
-        preview.window.set_title("Geodata Editor By Mk - v1.0");
+        preview.window.set_title("Geodata Editor By Mk - v1.1");
         configure_editor_theme(&preview.egui_context);
         let mut ui = EditorUi {
             open_path: options
@@ -1005,21 +1005,23 @@ impl EditorView {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Geodata");
-            if ui.button("Escolher L2J...").clicked() {
-                if let Some(path) = pick_l2j_file(&self.ui.open_path) {
+            if ui.button("Escolher geodata...").clicked() {
+                if let Some(path) = pick_geodata_file(&self.ui.open_path) {
                     self.ui.open_path = path.display().to_string();
                     self.ui.status = "Geodata selecionada. Abra o projeto quando terminar.".into();
                 }
             }
         });
-        selected_path_label(ui, &self.ui.open_path, "Nenhum arquivo L2J selecionado.");
+        selected_path_label(ui, &self.ui.open_path, "Nenhuma geodata selecionada.");
         ui.add_space(6.0);
         if ui.button("Carregar projeto").clicked() {
             *action = EditorAction::OpenProject;
         }
         ui.label(
-            egui::RichText::new("Salvar substitui a L2J aberta após criar um arquivo .l2j.bak.")
-                .size(egui::TextStyle::Small.resolve(ui.style()).size + 2.0),
+            egui::RichText::new(
+                "Salvar substitui a geodata aberta após criar uma cópia .<ext>.bak.",
+            )
+            .size(egui::TextStyle::Small.resolve(ui.style()).size + 2.0),
         );
     }
 
@@ -1546,13 +1548,13 @@ impl EditorView {
         }
         let path = PathBuf::from(self.ui.open_path.trim());
         if self.ui.open_path.trim().is_empty() {
-            self.ui.status = "Selecione o arquivo L2J que será editado.".into();
+            self.ui.status = "Selecione a geodata que será editada.".into();
             return;
         }
         let document = match Document::open(&path) {
             Ok(document) => document,
             Err(error) => {
-                self.ui.status = format!("Falha ao abrir L2J: {error}");
+                self.ui.status = format!("Falha ao abrir geodata: {error}");
                 return;
             }
         };
@@ -2258,10 +2260,10 @@ fn pick_map_file(client_root: &str) -> Option<PathBuf> {
     dialog.pick_file()
 }
 
-fn pick_l2j_file(current: &str) -> Option<PathBuf> {
+fn pick_geodata_file(current: &str) -> Option<PathBuf> {
     let mut dialog = FileDialog::new()
-        .set_title("Selecionar geodata L2J")
-        .add_filter("Geodata L2J", &["l2j"]);
+        .set_title("Selecionar geodata")
+        .add_filter("Geodata (.l2j, .l2g, _conv.dat)", &["l2j", "l2g", "dat"]);
     if let Some(directory) = dialog_directory(current) {
         dialog = dialog.set_directory(directory);
     }

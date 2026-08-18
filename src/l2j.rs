@@ -1,4 +1,4 @@
-//! L2J writer and lossless editable document.
+//! Lossless editable document for L2J, encrypted L2G, and `_conv.dat`.
 //!
 //! Clean blocks are copied straight from the opened file. This preserves old
 //! simple-block low nibbles that GeoEngine ignores, making an unedited export
@@ -325,11 +325,19 @@ pub struct SaveSummary {
     pub path: PathBuf,
 }
 
-/// Editable, validated L2J file. Saving over the opened source is allowed;
-/// the writer creates a `.l2j.bak` next to an existing destination first.
+#[derive(Clone, Debug)]
+enum StorageFormat {
+    L2j,
+    L2g { header: [u8; 4] },
+    ConvDat { header: [u8; 18] },
+}
+
+/// Editable, validated L2J, L2G, or `_conv.dat` file. Saving over the opened
+/// source is allowed; the writer creates a matching `.bak` copy first.
 #[derive(Clone, Debug)]
 pub struct Document {
     original_bytes: Vec<u8>,
+    format: StorageFormat,
     blocks: Vec<BlockState>,
     original_path: Option<PathBuf>,
     undo: Vec<EditOperation>,
@@ -339,7 +347,7 @@ pub struct Document {
 impl Document {
     /// A non-persistent empty canvas used only by the editor welcome screen.
     /// It is never saved automatically and is replaced when the user opens a
-    /// real L2J file.
+    /// real geodata file.
     pub fn blank() -> Self {
         let mut bytes = Vec::with_capacity(BLOCK_COUNT * 3);
         for _ in 0..BLOCK_COUNT {
@@ -351,17 +359,22 @@ impl Document {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let mut document = Self::from_bytes(fs::read(path)?)?;
+        let (format, bytes) = decode_storage(path, fs::read(path)?)?;
+        let mut document = Self::from_storage_bytes(bytes, format)?;
         document.original_path = Some(path.to_path_buf());
         Ok(document)
     }
 
     pub fn from_bytes(original_bytes: Vec<u8>) -> Result<Self> {
+        Self::from_storage_bytes(original_bytes, StorageFormat::L2j)
+    }
+
+    fn from_storage_bytes(original_bytes: Vec<u8>, format: StorageFormat) -> Result<Self> {
         let mut cursor = Cursor::new(&original_bytes);
         let mut blocks = Vec::with_capacity(BLOCK_COUNT);
         for index in 0..BLOCK_COUNT {
             let start = cursor.position;
-            let original = parse_block(&mut cursor, index)?;
+            let original = parse_block(&mut cursor, index, &format)?;
             blocks.push(BlockState {
                 current: original.clone(),
                 original,
@@ -370,12 +383,14 @@ impl Document {
         }
         if cursor.position != original_bytes.len() {
             return Err(AppError::InvalidData(format!(
-                "{} bytes remain after the 65,536 L2J blocks",
-                original_bytes.len() - cursor.position
+                "{} bytes remain after the 65,536 {} blocks",
+                original_bytes.len() - cursor.position,
+                format_name(&format),
             )));
         }
         Ok(Self {
             original_bytes,
+            format,
             blocks,
             original_path: None,
             undo: Vec::new(),
@@ -649,10 +664,15 @@ impl Document {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
+        let body = self.block_bytes()?;
+        encode_storage(&self.format, body, &self.blocks)
+    }
+
+    fn block_bytes(&self) -> Result<Vec<u8>> {
         let mut result = Vec::with_capacity(self.original_bytes.len());
         for state in &self.blocks {
             if state.dirty() {
-                write_editable_block(&mut result, &state.current)?;
+                write_editable_block(&mut result, &state.current, &self.format)?;
             } else {
                 result.extend_from_slice(&self.original_bytes[state.bytes.clone()]);
             }
@@ -662,14 +682,11 @@ impl Document {
 
     pub fn save_as(&self, destination: impl AsRef<Path>) -> Result<SaveSummary> {
         let destination = destination.as_ref();
-        if destination
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("l2j")
-        {
-            return Err(AppError::InvalidArgument(
-                "Salvar como precisa terminar em .l2j".into(),
-            ));
+        if !matches_destination(&self.format, destination) {
+            return Err(AppError::InvalidArgument(format!(
+                "Salvar como precisa manter o formato {}",
+                format_name(&self.format),
+            )));
         }
         let parent = destination.parent().unwrap_or_else(|| Path::new("."));
         if !parent.is_dir() {
@@ -679,13 +696,18 @@ impl Document {
             )));
         }
         let bytes = self.to_bytes()?;
-        let temporary = destination.with_extension("l2j.editor.tmp");
+        let extension = destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| AppError::InvalidArgument("arquivo de destino sem extensão".into()))?;
+        let temporary = destination.with_extension(format!("{extension}.editor.tmp"));
+        let backup = destination.with_extension(format!("{extension}.bak"));
         let write_result = (|| -> Result<()> {
             let mut file = File::create(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
             if destination.exists() {
-                fs::copy(destination, destination.with_extension("l2j.bak"))?;
+                fs::copy(destination, &backup)?;
             }
             // `rename` cannot replace a file on Windows. The complete temp
             // and backup exist before `copy` replaces the final path.
@@ -978,6 +1000,153 @@ impl Document {
     }
 }
 
+const L2G_CHECKSUM: i32 = -2_126_429_781;
+
+fn decode_storage(path: &Path, bytes: Vec<u8>) -> Result<(StorageFormat, Vec<u8>)> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| AppError::InvalidArgument("geodata file name is not valid Unicode".into()))?
+        .to_ascii_lowercase();
+    if name.ends_with("_conv.dat") {
+        let header: [u8; 18] = bytes
+            .get(..18)
+            .ok_or_else(|| {
+                AppError::InvalidData("Conv DAT header is shorter than 18 bytes".into())
+            })?
+            .try_into()
+            .expect("18-byte slice has a fixed length");
+        return Ok((StorageFormat::ConvDat { header }, bytes[18..].to_vec()));
+    }
+    match path.extension().and_then(|value| value.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("l2j") => Ok((StorageFormat::L2j, bytes)),
+        Some(extension) if extension.eq_ignore_ascii_case("l2g") => {
+            let header: [u8; 4] = bytes
+                .get(..4)
+                .ok_or_else(|| AppError::InvalidData("L2G header is shorter than 4 bytes".into()))?
+                .try_into()
+                .expect("4-byte slice has a fixed length");
+            let mut body = bytes[4..].to_vec();
+            decrypt_l2g_body(header, &mut body);
+            Ok((StorageFormat::L2g { header }, body))
+        }
+        _ => Err(AppError::InvalidArgument(
+            "unsupported geodata format; expected .l2j, .l2g, or _conv.dat".into(),
+        )),
+    }
+}
+
+fn encode_storage(
+    format: &StorageFormat,
+    mut body: Vec<u8>,
+    blocks: &[BlockState],
+) -> Result<Vec<u8>> {
+    match format {
+        StorageFormat::L2j => Ok(body),
+        StorageFormat::L2g { header } => {
+            encrypt_l2g_body(*header, &mut body);
+            let mut output = Vec::with_capacity(header.len() + body.len());
+            output.extend_from_slice(header);
+            output.extend_from_slice(&body);
+            Ok(output)
+        }
+        StorageFormat::ConvDat { header } => {
+            let mut output = if blocks.iter().any(BlockState::dirty) {
+                conv_dat_header(*header, blocks)?
+            } else {
+                header.to_vec()
+            };
+            output.extend_from_slice(&body);
+            Ok(output)
+        }
+    }
+}
+
+fn format_name(format: &StorageFormat) -> &'static str {
+    match format {
+        StorageFormat::L2j => ".l2j",
+        StorageFormat::L2g { .. } => ".l2g",
+        StorageFormat::ConvDat { .. } => "_conv.dat",
+    }
+}
+
+fn matches_destination(format: &StorageFormat, path: &Path) -> bool {
+    match format {
+        StorageFormat::L2j => path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("l2j")),
+        StorageFormat::L2g { .. } => path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("l2g")),
+        StorageFormat::ConvDat { .. } => path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.to_ascii_lowercase().ends_with("_conv.dat")),
+    }
+}
+
+fn decrypt_l2g_body(header: [u8; 4], body: &mut [u8]) {
+    let checksum = L2G_CHECKSUM ^ i32::from_be_bytes(header);
+    if checksum == 0 {
+        return;
+    }
+    let mut key = checksum
+        .to_be_bytes()
+        .into_iter()
+        .fold(0, |key, byte| key ^ byte);
+    for byte in body {
+        let decrypted = *byte ^ key;
+        *byte = decrypted;
+        key = decrypted;
+    }
+}
+
+fn encrypt_l2g_body(header: [u8; 4], body: &mut [u8]) {
+    let checksum = L2G_CHECKSUM ^ i32::from_be_bytes(header);
+    if checksum == 0 {
+        return;
+    }
+    let mut key = checksum
+        .to_be_bytes()
+        .into_iter()
+        .fold(0, |key, byte| key ^ byte);
+    for byte in body {
+        let plain = *byte;
+        *byte = plain ^ key;
+        key = plain;
+    }
+}
+
+fn conv_dat_header(original: [u8; 18], blocks: &[BlockState]) -> Result<Vec<u8>> {
+    let mut flat_blocks = 0_i32;
+    let mut flat_and_complex_blocks = 0_i32;
+    let mut cell_count = 0_i32;
+    for state in blocks {
+        match &state.current {
+            EditableBlock::Simple(_) => {
+                flat_blocks += 1;
+                flat_and_complex_blocks += 1;
+            }
+            EditableBlock::Complex(_) => {
+                flat_and_complex_blocks += 1;
+                cell_count += COLUMNS_PER_BLOCK as i32;
+            }
+            EditableBlock::Multilayer { offsets, .. } => {
+                cell_count += i32::from(offsets[COLUMNS_PER_BLOCK]);
+            }
+        }
+    }
+    let mut header = Vec::with_capacity(18);
+    header.extend_from_slice(&original[..2]);
+    write_i16(&mut header, 128);
+    write_i16(&mut header, 16);
+    write_i32(&mut header, cell_count);
+    write_i32(&mut header, flat_and_complex_blocks);
+    write_i32(&mut header, flat_blocks);
+    Ok(header)
+}
 struct Cursor<'a> {
     data: &'a [u8],
     position: usize,
@@ -1004,7 +1173,18 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn parse_block(cursor: &mut Cursor<'_>, index: usize) -> Result<EditableBlock> {
+fn parse_block(
+    cursor: &mut Cursor<'_>,
+    index: usize,
+    format: &StorageFormat,
+) -> Result<EditableBlock> {
+    match format {
+        StorageFormat::L2j | StorageFormat::L2g { .. } => parse_standard_block(cursor, index),
+        StorageFormat::ConvDat { .. } => parse_conv_dat_block(cursor, index),
+    }
+}
+
+fn parse_standard_block(cursor: &mut Cursor<'_>, index: usize) -> Result<EditableBlock> {
     match cursor.read_u8(index)? {
         0 => Ok(EditableBlock::Simple(Layer {
             height: cursor.read_i16(index)? & !0x000f,
@@ -1017,29 +1197,63 @@ fn parse_block(cursor: &mut Cursor<'_>, index: usize) -> Result<EditableBlock> {
             }
             Ok(EditableBlock::Complex(cells))
         }
-        2 => {
-            let mut offsets = [0u16; COLUMNS_PER_BLOCK + 1];
-            let mut layers = Vec::with_capacity(COLUMNS_PER_BLOCK);
-            for column in 0..COLUMNS_PER_BLOCK {
-                let count = cursor.read_u8(index)? as usize;
-                if count == 0 {
-                    return Err(AppError::InvalidData(format!(
-                        "empty multilayer column {column} in block {index}"
-                    )));
-                }
-                for _ in 0..count {
-                    layers.push(unpack(cursor.read_i16(index)?));
-                }
-                offsets[column + 1] = u16::try_from(layers.len()).map_err(|_| {
-                    AppError::InvalidData(format!("too many layers in block {index}"))
-                })?;
-            }
-            Ok(EditableBlock::Multilayer { offsets, layers })
-        }
+        2 => read_multilayer_block(cursor, index, false),
         kind => Err(AppError::InvalidData(format!(
-            "invalid L2J block type {kind} at block {index}"
+            "invalid L2J/L2G block type {kind} at block {index}"
         ))),
     }
+}
+
+fn parse_conv_dat_block(cursor: &mut Cursor<'_>, index: usize) -> Result<EditableBlock> {
+    match cursor.read_i16(index)? {
+        0 => {
+            let height = cursor.read_i16(index)? & !0x000f;
+            let _minimum_height = cursor.read_i16(index)?;
+            Ok(EditableBlock::Simple(Layer {
+                height,
+                nswe: Layer::OPEN,
+            }))
+        }
+        64 => {
+            let mut cells = [Layer::default(); COLUMNS_PER_BLOCK];
+            for cell in &mut cells {
+                *cell = unpack(cursor.read_i16(index)?);
+            }
+            Ok(EditableBlock::Complex(cells))
+        }
+        _multilayer_type => read_multilayer_block(cursor, index, true),
+    }
+}
+
+fn read_multilayer_block(
+    cursor: &mut Cursor<'_>,
+    index: usize,
+    wide_counts: bool,
+) -> Result<EditableBlock> {
+    let mut offsets = [0u16; COLUMNS_PER_BLOCK + 1];
+    let mut layers = Vec::with_capacity(COLUMNS_PER_BLOCK);
+    for column in 0..COLUMNS_PER_BLOCK {
+        let count = if wide_counts {
+            usize::try_from(cursor.read_i16(index)?).map_err(|_| {
+                AppError::InvalidData(format!(
+                    "negative Conv DAT layer count in column {column} of block {index}"
+                ))
+            })?
+        } else {
+            cursor.read_u8(index)? as usize
+        };
+        if count == 0 {
+            return Err(AppError::InvalidData(format!(
+                "empty multilayer column {column} in block {index}"
+            )));
+        }
+        for _ in 0..count {
+            layers.push(unpack(cursor.read_i16(index)?));
+        }
+        offsets[column + 1] = u16::try_from(layers.len())
+            .map_err(|_| AppError::InvalidData(format!("too many layers in block {index}")))?;
+    }
+    Ok(EditableBlock::Multilayer { offsets, layers })
 }
 
 fn unpack(raw: i16) -> Layer {
@@ -1059,8 +1273,19 @@ fn normalize_editable_height(value: i32) -> Result<i16> {
     Ok(normalized as i16)
 }
 
-fn write_editable_block(output: &mut Vec<u8>, block: &EditableBlock) -> Result<()> {
+fn write_editable_block(
+    output: &mut Vec<u8>,
+    block: &EditableBlock,
+    format: &StorageFormat,
+) -> Result<()> {
     block.validate(0)?;
+    match format {
+        StorageFormat::L2j | StorageFormat::L2g { .. } => write_standard_block(output, block),
+        StorageFormat::ConvDat { .. } => write_conv_dat_block(output, block),
+    }
+}
+
+fn write_standard_block(output: &mut Vec<u8>, block: &EditableBlock) -> Result<()> {
     match block {
         EditableBlock::Simple(layer) => {
             output.push(0);
@@ -1077,12 +1302,55 @@ fn write_editable_block(output: &mut Vec<u8>, block: &EditableBlock) -> Result<(
             for column in 0..COLUMNS_PER_BLOCK {
                 let column = &layers[offsets[column] as usize..offsets[column + 1] as usize];
                 output.push(u8::try_from(column.len()).map_err(|_| {
-                    AppError::InvalidData("L2J column has more than 255 layers".into())
+                    AppError::InvalidData("L2J/L2G column has more than 255 layers".into())
                 })?);
                 for layer in column {
                     write_complex(output, *layer);
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn write_conv_dat_block(output: &mut Vec<u8>, block: &EditableBlock) -> Result<()> {
+    match block {
+        EditableBlock::Simple(layer) => {
+            write_i16(output, 0);
+            write_i16(output, layer.height & !0x000f);
+            write_i16(output, layer.height & !0x000f);
+        }
+        EditableBlock::Complex(cells) => {
+            write_i16(output, 64);
+            for layer in cells {
+                write_complex(output, *layer);
+            }
+        }
+        EditableBlock::Multilayer { offsets, layers } => {
+            let payload_start = output.len();
+            output.extend_from_slice(&[0, 0]);
+            for column in 0..COLUMNS_PER_BLOCK {
+                let column = &layers[offsets[column] as usize..offsets[column + 1] as usize];
+
+                write_i16(
+                    output,
+                    i16::try_from(column.len()).map_err(|_| {
+                        AppError::InvalidData("Conv DAT column has more than 32,767 layers".into())
+                    })?,
+                );
+                for layer in column {
+                    write_complex(output, *layer);
+                }
+            }
+            let payload_size = output.len() - payload_start - 2;
+            let kind = 64
+                + payload_size.checked_sub(128).ok_or_else(|| {
+                    AppError::InvalidData("Conv DAT multilayer payload is too short".into())
+                })?;
+            let kind = i16::try_from(kind).map_err(|_| {
+                AppError::InvalidData("Conv DAT multilayer payload is too large".into())
+            })?;
+            output[payload_start..payload_start + 2].copy_from_slice(&kind.to_le_bytes());
         }
     }
     Ok(())
@@ -1114,6 +1382,10 @@ fn direction_name(direction: Direction) -> &'static str {
     }
 }
 fn write_i16(output: &mut Vec<u8>, value: i16) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_i32(output: &mut Vec<u8>, value: i32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 fn write_complex(output: &mut Vec<u8>, layer: Layer) {
@@ -1328,5 +1600,119 @@ mod tests {
         );
         assert!(document.undo());
         assert_eq!(document.block_type(0, 0), Some(EditableBlockType::Simple));
+    }
+    fn l2g_file(body: Vec<u8>) -> Vec<u8> {
+        let header = [0x12, 0x34, 0x56, 0x78];
+        let mut encrypted = body;
+        encrypt_l2g_body(header, &mut encrypted);
+        let mut file = Vec::with_capacity(header.len() + encrypted.len());
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&encrypted);
+        file
+    }
+
+    fn conv_dat_file(height: i16) -> Vec<u8> {
+        let mut file = Vec::with_capacity(18 + BLOCK_COUNT * 6);
+        file.extend_from_slice(&[20, 20]);
+        write_i16(&mut file, 128);
+        write_i16(&mut file, 16);
+        write_i32(&mut file, 0);
+        write_i32(&mut file, BLOCK_COUNT as i32);
+        write_i32(&mut file, BLOCK_COUNT as i32);
+        for _ in 0..BLOCK_COUNT {
+            write_i16(&mut file, 0);
+            write_i16(&mut file, height);
+            write_i16(&mut file, height);
+        }
+        file
+    }
+
+    fn temporary_geodata_path(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after Unix epoch")
+            .as_nanos();
+        let source = Path::new(name);
+        if let Some(prefix) = name.strip_suffix("_conv.dat") {
+            return std::env::temp_dir()
+                .join(format!("{prefix}-{}-{nonce}_conv.dat", std::process::id()));
+        }
+        let stem = source
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("test file name has a valid stem");
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .expect("test file name has an extension");
+        std::env::temp_dir().join(format!("{stem}-{}-{nonce}.{extension}", std::process::id()))
+    }
+
+    #[test]
+    fn opens_edits_and_reencrypts_l2g() {
+        let path = temporary_geodata_path("geodata-editor.l2g");
+        let backup = path.with_extension("l2g.bak");
+        let original = l2g_file(simple_file(32));
+        fs::write(&path, &original).expect("write L2G");
+
+        let mut document = Document::open(&path).expect("open L2G");
+        assert_eq!(
+            document.cell(LayerAddress::new(0, 0, 0)).unwrap().height,
+            32
+        );
+        assert_eq!(document.to_bytes().expect("round-trip L2G"), original);
+        document.set_nswe([LayerAddress::new(0, 0, 0)], 0, "bloquear");
+        document.save_as(&path).expect("save L2G");
+
+        assert_eq!(fs::read(&backup).expect("read L2G backup"), original);
+        assert_eq!(
+            Document::open(&path)
+                .expect("reopen saved L2G")
+                .cell(LayerAddress::new(0, 0, 0))
+                .unwrap()
+                .nswe,
+            0
+        );
+        fs::remove_file(path).expect("remove temporary L2G");
+        fs::remove_file(backup).expect("remove L2G backup");
+    }
+
+    #[test]
+    fn opens_edits_and_rewrites_conv_dat_header() {
+        let path = temporary_geodata_path("20_20_conv.dat");
+        let backup = path.with_extension("dat.bak");
+        let original = conv_dat_file(32);
+        fs::write(&path, &original).expect("write Conv DAT");
+
+        let mut document = Document::open(&path).expect("open Conv DAT");
+        assert_eq!(
+            document.cell(LayerAddress::new(0, 0, 0)).unwrap().height,
+            32
+        );
+        assert_eq!(document.to_bytes().expect("round-trip Conv DAT"), original);
+        document.set_nswe([LayerAddress::new(0, 0, 0)], 0, "bloquear");
+        document.save_as(&path).expect("save Conv DAT");
+
+        let saved = fs::read(&path).expect("read saved Conv DAT");
+        assert_eq!(fs::read(&backup).expect("read Conv DAT backup"), original);
+        assert_eq!(i32::from_le_bytes(saved[6..10].try_into().unwrap()), 64);
+        assert_eq!(
+            i32::from_le_bytes(saved[10..14].try_into().unwrap()),
+            BLOCK_COUNT as i32
+        );
+        assert_eq!(
+            i32::from_le_bytes(saved[14..18].try_into().unwrap()),
+            BLOCK_COUNT as i32 - 1
+        );
+        assert_eq!(
+            Document::open(&path)
+                .expect("reopen saved Conv DAT")
+                .cell(LayerAddress::new(0, 0, 0))
+                .unwrap()
+                .nswe,
+            0
+        );
+        fs::remove_file(path).expect("remove temporary Conv DAT");
+        fs::remove_file(backup).expect("remove Conv DAT backup");
     }
 }

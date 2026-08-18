@@ -114,7 +114,9 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
         .skip(1)
         .any(|value| value == "--help" || value == "-h")
     {
-        println!("GeodataEditor [--input <arquivo.l2j>] [--client-root <cliente> --map <mapa>]");
+        println!(
+            "GeodataEditor [--input <arquivo.l2j|arquivo.l2g|mapa_conv.dat>] [--client-root <cliente> --map <mapa>]"
+        );
         return Ok(());
     }
     let options = parse(arguments)?;
@@ -135,7 +137,9 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<EditorOpti
         .iter()
         .any(|value| value == "--help" || value == "-h")
     {
-        println!("GeodataEditor [--input <arquivo.l2j>] [--client-root <cliente> --map <mapa>]");
+        println!(
+            "GeodataEditor [--input <arquivo.l2j|arquivo.l2g|mapa_conv.dat>] [--client-root <cliente> --map <mapa>]"
+        );
         return Err(AppError::InvalidArgument(String::new()));
     }
     let mut options = EditorOptions::default();
@@ -182,7 +186,7 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<EditorOpti
     if let Some(input) = &options.input {
         if !input.is_file() {
             return Err(AppError::InvalidArgument(format!(
-                "invalid L2J input: {}",
+                "invalid geodata input: {}",
                 input.display()
             )));
         }
