@@ -85,6 +85,7 @@ pub fn run_editor(options: EditorOptions) -> Result<()> {
                             button: MouseButton::Left,
                             ..
                         } => editor.input(event, !egui_response.consumed),
+                        event if escape_pressed(&event) => editor.input(event, false),
                         event if !egui_response.consumed => editor.input(event, true),
                         _ => {}
                     }
@@ -95,6 +96,16 @@ pub fn run_editor(options: EditorOptions) -> Result<()> {
             }
         })
         .map_err(|error| AppError::InvalidData(format!("editor event loop failed: {error}")))
+}
+
+fn escape_pressed(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::KeyboardInput { event, .. }
+            if event.state == ElementState::Pressed
+                && !event.repeat
+                && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
+    )
 }
 
 fn editor_source_map(options: &EditorOptions) -> Result<(SourceMap, usize)> {
@@ -412,6 +423,7 @@ struct EditorView {
 #[derive(Default)]
 struct EditorUi {
     open_path: String,
+    selection_hidden: bool,
     client_root: String,
     map_name: String,
     selected: LayerAddress,
@@ -491,10 +503,20 @@ impl EditorOverlayOptions {
 }
 
 fn editor_active_selection(ui: &EditorUi) -> Vec<LayerAddress> {
-    if ui.selection.is_empty() {
+    if ui.selection_hidden {
+        Vec::new()
+    } else if ui.selection.is_empty() {
         vec![ui.selected]
     } else {
         ui.selection.clone()
+    }
+}
+
+fn editor_active_selection_count(ui: &EditorUi) -> usize {
+    if ui.selection_hidden {
+        0
+    } else {
+        ui.selection.len().max(1)
     }
 }
 
@@ -681,6 +703,9 @@ impl EditorView {
                             self.apply_height(self.ui.height_input.saturating_add(delta));
                         }
                     }
+                    if code == KeyCode::Escape && !key.repeat {
+                        self.clear_active_selection();
+                    }
                     if !key.repeat {
                         let ctrl = self.preview.input.pressed.contains(&KeyCode::ControlLeft)
                             || self.preview.input.pressed.contains(&KeyCode::ControlRight);
@@ -775,6 +800,7 @@ impl EditorView {
                                 self.ui.selected = cell;
                                 self.ui.visible_layer = cell.layer;
                                 self.ui.selection.clear();
+                                self.ui.selection_hidden = false;
                                 self.refresh_editor_meshes();
                                 self.ui.status = format!(
                                     "Célula selecionada: Geo {},{} | camada {}.",
@@ -1168,7 +1194,7 @@ impl EditorView {
         response.on_hover_text(
             "Seleciona a grade 8×8 do bloco atual na camada visível. Ao aplicar um preset, um bloco Simple é promovido automaticamente para Complex, permitindo alterar as células individualmente.",
         );
-        let selection_count = self.ui.selection.len().max(1);
+        let selection_count = editor_active_selection_count(&self.ui);
         ui.label(
             egui::RichText::new(format!("{} célula(s) ativa(s)", selection_count))
                 .color(egui::Color32::from_rgb(42, 202, 219)),
@@ -1430,7 +1456,10 @@ impl EditorView {
                 ui.separator();
                 ui.label(format!("BLOCO: {bx},{by}"));
                 ui.separator();
-                ui.label(format!("SELEÇÃO: {}", self.ui.selection.len().max(1)));
+                ui.label(format!(
+                    "SELEÇÃO: {}",
+                    editor_active_selection_count(&self.ui)
+                ));
                 ui.separator();
                 ui.label(format!("ALTERADOS: {}", self.document.changed_blocks()));
                 ui.separator();
@@ -1439,7 +1468,7 @@ impl EditorView {
         );
         ui.separator();
         let status = if self.ui.status.is_empty() {
-            "Pronto. Clique para selecionar; Shift adiciona e Ctrl segue uma faixa."
+            "Pronto. Clique para selecionar; Shift adiciona; Ctrl segue uma faixa; Esc limpa."
         } else {
             &self.ui.status
         };
@@ -1457,6 +1486,18 @@ impl EditorView {
             && (!self.loaded || !self.has_context)
         {
             self.ui.status = "Carregue cliente, mapa e geodata antes de editar.".into();
+            return;
+        }
+        if self.ui.selection_hidden
+            && matches!(
+                action,
+                EditorAction::RestoreBlock
+                    | EditorAction::Convert(_)
+                    | EditorAction::ApplyPreset(_)
+                    | EditorAction::SetHeight(_)
+            )
+        {
+            self.ui.status = "Selecione uma célula antes de editar.".into();
             return;
         }
         match action {
@@ -1497,6 +1538,10 @@ impl EditorView {
 
     fn apply_preset(&mut self, mask: u8) {
         let targets = self.edit_targets();
+        if targets.is_empty() {
+            self.ui.status = "Selecione uma célula antes de aplicar um preset.".into();
+            return;
+        }
         let result = self
             .document
             .force_set_nswe(targets, mask, format!("Preset NSWE {mask:04b}"));
@@ -1516,6 +1561,10 @@ impl EditorView {
 
     fn apply_height(&mut self, requested_height: i32) {
         let targets = self.edit_targets();
+        if targets.is_empty() {
+            self.ui.status = "Selecione uma célula antes de alterar a altura.".into();
+            return;
+        }
         match self.document.set_height(
             targets,
             requested_height,
@@ -1551,6 +1600,9 @@ impl EditorView {
     }
 
     fn edit_targets(&self) -> Vec<LayerAddress> {
+        if self.ui.selection_hidden {
+            return Vec::new();
+        }
         if !self.ui.selection.is_empty() {
             return self.ui.selection.clone();
         }
@@ -1587,6 +1639,7 @@ impl EditorView {
         self.ui.selected = selection[0];
         self.ui.height_input_address = None;
         self.ui.selection = selection;
+        self.ui.selection_hidden = false;
         self.ui.rectangle_start = None;
         self.ui.line_start = None;
         self.ui.status = format!(
@@ -1663,6 +1716,7 @@ impl EditorView {
         self.has_context = true;
 
         self.ui.selection.clear();
+        self.ui.selection_hidden = false;
         self.ui.height_input_address = None;
         self.ui.status = format!(
             "Projeto carregado: {} com {} pacotes de contexto.",
@@ -1725,6 +1779,19 @@ impl EditorView {
 
     fn refresh_geodata(&mut self) {
         self.refresh_editor_meshes();
+    }
+
+    fn clear_active_selection(&mut self) {
+        if self.ui.selection_hidden || !self.loaded || !self.has_context {
+            return;
+        }
+        self.ui.selection_hidden = true;
+        self.ui.selection.clear();
+        self.ui.rectangle_start = None;
+        self.ui.line_start = None;
+        self.ui.pending_plain_selection = false;
+        self.refresh_selection_mesh();
+        self.ui.status = "Seleção removida.".into();
     }
 
     fn active_selection(&self) -> Vec<LayerAddress> {
@@ -1811,9 +1878,10 @@ impl EditorView {
         let (min_x, max_x) = (start.x.min(end.x), start.x.max(end.x));
         let (min_y, max_y) = (start.y.min(end.y), start.y.max(end.y));
         let mut selection = std::mem::take(&mut self.ui.selection);
-        if selection.is_empty() {
+        if selection.is_empty() && !self.ui.selection_hidden {
             selection.push(self.ui.selected);
         }
+        self.ui.selection_hidden = false;
         let mut selected_cells = selection
             .iter()
             .map(|cell| (cell.x, cell.y, cell.layer))
@@ -1848,7 +1916,10 @@ impl EditorView {
     }
 
     fn toggle_selection(&mut self, cell: LayerAddress) {
-        if self.ui.selection.is_empty() {
+        if self.ui.selection_hidden {
+            self.ui.selection.clear();
+            self.ui.selection_hidden = false;
+        } else if self.ui.selection.is_empty() {
             self.ui.selection.push(self.ui.selected);
         }
         self.ui.selected = cell;
@@ -1865,6 +1936,7 @@ impl EditorView {
     }
 
     fn select_line_endpoint(&mut self, cell: LayerAddress) {
+        self.ui.selection_hidden = false;
         let Some(start) = self.ui.line_start.take() else {
             self.ui.line_start = Some(cell);
             self.ui.selected = cell;
@@ -1886,6 +1958,7 @@ impl EditorView {
         let (selection, followed_strip) = flexible_line_selection(&self.document, start, cell)
             .map(|selection| (selection, true))
             .unwrap_or_else(|| (straight_line_selection(&self.document, start, cell), false));
+        self.ui.selection_hidden = false;
         self.ui.selected = cell;
         self.ui.visible_layer = cell.layer;
         self.ui.selection = selection;
@@ -4004,6 +4077,7 @@ fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
     let lower = color / vec3<f32>(12.92);
     let upper = pow((color + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
     return select(lower, upper, color > vec3<f32>(0.04045));
+
 }
 "#;
 
@@ -4080,6 +4154,20 @@ mod tests {
             })[3]
                 > 100
         );
+    }
+    #[test]
+    fn hidden_selection_has_no_active_cells() {
+        let mut ui = EditorUi {
+            selected: LayerAddress::new(12, 34, 0),
+            ..Default::default()
+        };
+        assert_eq!(editor_active_selection(&ui), vec![ui.selected]);
+        assert_eq!(editor_active_selection_count(&ui), 1);
+
+        ui.selection_hidden = true;
+
+        assert!(editor_active_selection(&ui).is_empty());
+        assert_eq!(editor_active_selection_count(&ui), 0);
     }
 
     #[test]
