@@ -2280,6 +2280,19 @@ fn pick_geodata_file(current: &str) -> Option<PathBuf> {
     dialog.pick_file()
 }
 
+fn editor_selection_footprint(
+    document: &Document,
+    address: LayerAddress,
+) -> (usize, usize, f32, bool) {
+    let block_x = address.x / 8;
+    let block_y = address.y / 8;
+    if document.block_type(block_x, block_y) == Some(EditableBlockType::Simple) {
+        (block_x * 8, block_y * 8, 63.4, true)
+    } else {
+        (address.x, address.y, 7.35, false)
+    }
+}
+
 fn editor_selection_instances(
     map: &SourceMap,
     document: &Document,
@@ -2287,6 +2300,7 @@ fn editor_selection_instances(
     selection: &[LayerAddress],
 ) -> CpuGeodata {
     let mut mesh = CpuGeodata::default();
+    let mut selected_simple_blocks = HashSet::new();
     for address in selection {
         let Some(cell) = document.cell(*address) else {
             continue;
@@ -2294,14 +2308,17 @@ fn editor_selection_instances(
         if cell.height == NULL_HEIGHT {
             continue;
         }
-        let scale = 7.35;
+        let (x, y, scale, is_simple) = editor_selection_footprint(document, *address);
+        if is_simple && !selected_simple_blocks.insert((x / 8, y / 8)) {
+            continue;
+        }
         mesh.instances.push(GeodataInstance {
             position: [
-                map.bounds.min.x + address.x as f32 * 16.0 + scale - origin.x,
+                map.bounds.min.x + x as f32 * 16.0 + scale - origin.x,
                 // Match the coloured cell plane with only enough separation
                 // to avoid depth fighting; the higher NSWE glyph stays clear.
                 cell.height as f32 - origin.y + 1.4,
-                map.bounds.min.z + address.y as f32 * 16.0 + scale - origin.z,
+                map.bounds.min.z + y as f32 * 16.0 + scale - origin.z,
             ],
             scale,
             color: [255, 235, 0, 255],
@@ -3785,6 +3802,7 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) offset: vec2<f32>,
+    @location(2) scale: f32,
 };
 
 @vertex
@@ -3794,6 +3812,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.position = camera.view_projection * vec4<f32>(point, 1.0);
     output.color = input.color;
     output.offset = input.offset;
+    output.scale = input.scale;
     return output;
 }
 
@@ -3804,13 +3823,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_selection(input: VertexOutput) -> @location(0) vec4<f32> {
-    let edge_distance = 1.0 - max(abs(input.offset.x), abs(input.offset.y));
-    if edge_distance > 0.22 {
+    let edge_distance = (1.0 - max(abs(input.offset.x), abs(input.offset.y))) * input.scale;
+    if edge_distance > 2.0 {
         discard;
     }
     let black = vec3<f32>(0.015, 0.015, 0.015);
     let yellow = srgb_to_linear(input.color.rgb);
-    let is_yellow = edge_distance >= 0.045 && edge_distance <= 0.175;
+    let is_yellow = edge_distance >= 0.35 && edge_distance <= 1.65;
     return vec4<f32>(select(black, yellow, is_yellow), 1.0);
 }
 
@@ -3893,6 +3912,23 @@ mod tests {
                 nswe: 15
             })[3]
                 > 100
+        );
+    }
+
+    #[test]
+    fn simple_selection_uses_the_whole_eight_by_eight_block_footprint() {
+        let mut document = Document::blank();
+        let address = LayerAddress::new(13, 22, 0);
+
+        assert_eq!(
+            editor_selection_footprint(&document, address),
+            (8, 16, 63.4, true)
+        );
+
+        document.convert_simple_to_complex(1, 2).unwrap();
+        assert_eq!(
+            editor_selection_footprint(&document, address),
+            (13, 22, 7.35, false)
         );
     }
 
