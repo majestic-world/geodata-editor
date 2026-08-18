@@ -1,0 +1,33 @@
+[package]
+name = "geodata-editor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Standalone Lineage II L2J geodata editor"
+license = "UNLICENSED"
+build = "build.rs"
+autobins = false
+
+[[bin]]
+name = "GeodataEditor"
+path = "src/bin/geodata_editor.rs"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+panic = "abort"
+
+[dependencies]
+bytemuck = { version = "1.16", features = ["derive"] }
+egui = "0.27"
+egui-wgpu = "0.27"
+egui-winit = "0.27"
+png = "0.18.1"
+pollster = "0.3"
+rfd = "0.16"
+wgpu = "0.19"
+winit = "0.29"
+
+[build-dependencies]
+embed-resource = "3.0"
