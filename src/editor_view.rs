@@ -159,7 +159,6 @@ struct Preview {
     line_pipeline: wgpu::RenderPipeline,
     geodata_line_pipeline: wgpu::RenderPipeline,
     geodata_overlay_pipeline: wgpu::RenderPipeline,
-    geodata_selection_pipeline: wgpu::RenderPipeline,
     nswe_icon_pipeline: wgpu::RenderPipeline,
     nswe_icon_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
@@ -280,20 +279,8 @@ impl Preview {
             create_pipelines(&device, &camera_layout, format);
         let (_, _, geodata_line_pipeline) =
             create_geodata_pipelines(&device, &camera_layout, format);
-        let geodata_overlay_pipeline = create_geodata_editor_pipeline(
-            &device,
-            &camera_layout,
-            format,
-            "geodata-editor-overlay",
-            "fs_main",
-        );
-        let geodata_selection_pipeline = create_geodata_editor_pipeline(
-            &device,
-            &camera_layout,
-            format,
-            "geodata-editor-selection",
-            "fs_selection",
-        );
+        let geodata_overlay_pipeline =
+            create_geodata_overlay_pipeline(&device, &camera_layout, format);
         let (nswe_icon_pipeline, nswe_icon_bind_group) =
             create_nswe_icon_resources(&device, &queue, &camera_layout, format);
         let depth_view = create_depth_view(&device, &config);
@@ -326,7 +313,6 @@ impl Preview {
             line_pipeline,
             geodata_line_pipeline,
             geodata_overlay_pipeline,
-            geodata_selection_pipeline,
             nswe_icon_pipeline,
             nswe_icon_bind_group,
             camera_buffer,
@@ -515,7 +501,6 @@ struct EditorView {
     ui: EditorUi,
     geodata_mesh: GeodataInstances,
     nswe_icon_mesh: NsweIconInstances,
-    selection_mesh: GeodataInstances,
     /// One icon for every NSWE mask. They are embedded in the executable, so
     /// the distributed editor keeps working without an adjacent data folder.
     nswe_icons: [egui::TextureHandle; 16],
@@ -533,7 +518,8 @@ struct EditorUi {
     line_start: Option<LayerAddress>,
     pending_plain_selection: bool,
     visible_layer: usize,
-    brush_radius: usize,
+    brush_width: usize,
+    brush_height: usize,
     visual_stride: usize,
     show_nswe_icons: bool,
     show_selected_layer_only: bool,
@@ -600,6 +586,47 @@ impl EditorOverlayOptions {
 
     fn shows_layer(self, layer: usize) -> bool {
         !self.show_selected_layer_only || layer == self.selected.layer
+    }
+}
+
+#[derive(Default)]
+struct EditorSelectionLookup {
+    cells: HashSet<(usize, usize, usize)>,
+    simple_blocks: HashSet<(usize, usize)>,
+}
+
+impl EditorSelectionLookup {
+    fn new(document: &Document, selection: &[LayerAddress]) -> Self {
+        let mut lookup = Self::default();
+        for address in selection {
+            let block = (address.x / 8, address.y / 8);
+            if document.block_type(block.0, block.1) == Some(EditableBlockType::Simple) {
+                lookup.simple_blocks.insert(block);
+            } else {
+                lookup.cells.insert((address.x, address.y, address.layer));
+            }
+        }
+        lookup
+    }
+
+    fn contains_cell(&self, x: usize, y: usize, layer: usize) -> bool {
+        self.cells.contains(&(x, y, layer))
+    }
+
+    fn contains_simple_block(&self, block_x: usize, block_y: usize) -> bool {
+        self.simple_blocks.contains(&(block_x, block_y))
+    }
+
+    fn sampled_area_contains_cell(
+        &self,
+        start_x: usize,
+        start_y: usize,
+        layer: usize,
+        stride: usize,
+    ) -> bool {
+        let end_x = start_x.saturating_add(stride).min(l2j::MAP_CELLS);
+        let end_y = start_y.saturating_add(stride).min(l2j::MAP_CELLS);
+        (start_x..end_x).any(|x| (start_y..end_y).any(|y| self.cells.contains(&(x, y, layer))))
     }
 }
 
@@ -719,7 +746,8 @@ impl EditorView {
                 .map(|path| path.display().to_string())
                 .unwrap_or(memory.client_root),
             map_name: options.map.clone().unwrap_or(memory.map_name),
-            brush_radius: 1,
+            brush_width: 1,
+            brush_height: 1,
             visual_stride: 1,
             show_nswe_icons: true,
             open_context_radius: 16,
@@ -732,6 +760,8 @@ impl EditorView {
         }
         let max_layer_count = document.max_layer_count().max(1);
         let origin = map_origin(preview.source_map.bounds);
+        let active_selection = editor_active_selection(&ui);
+        let selection_lookup = EditorSelectionLookup::new(&document, &active_selection);
         let geodata_mesh = GeodataInstances::new(
             &preview.device,
             &editor_geodata_instances(
@@ -740,6 +770,7 @@ impl EditorView {
                 origin,
                 ui.visual_stride,
                 EditorOverlayOptions::from_ui(&ui),
+                &selection_lookup,
             ),
         );
         let nswe_icon_mesh = NsweIconInstances::new(
@@ -750,16 +781,7 @@ impl EditorView {
                 origin,
                 ui.visual_stride,
                 EditorOverlayOptions::from_ui(&ui),
-            ),
-        );
-        let selection_mesh = GeodataInstances::new(
-            &preview.device,
-            &editor_selection_instances(
-                &preview.source_map,
-                &document,
-                origin,
-                &editor_active_selection(&ui),
-                ui.hide_fully_open_blocks,
+                &selection_lookup,
             ),
         );
         let nswe_icons = load_nswe_icons(&preview.egui_context);
@@ -773,7 +795,6 @@ impl EditorView {
             ui,
             geodata_mesh,
             nswe_icon_mesh,
-            selection_mesh,
             nswe_icons,
         };
         if view.loaded && view.has_context {
@@ -897,16 +918,7 @@ impl EditorView {
                             }
                         } else if pending_plain_selection {
                             if let Some(cell) = self.pick() {
-                                self.ui.line_start = None;
-                                self.ui.selected = cell;
-                                self.ui.visible_layer = cell.layer;
-                                self.ui.selection.clear();
-                                self.ui.selection_hidden = false;
-                                self.refresh_editor_meshes();
-                                self.ui.status = format!(
-                                    "Célula selecionada: Geo {},{} | camada {}.",
-                                    cell.x, cell.y, cell.layer
-                                );
+                                self.select_brush_area(cell);
                             } else {
                                 self.ui.status = "Nenhuma célula L2J foi atingida. Aponte a câmera para a superfície e tente novamente.".into();
                             }
@@ -991,15 +1003,8 @@ impl EditorView {
                     &self.preview.camera_bind_group,
                     false,
                 );
-                // Selection changes the cell surface itself. Render the NSWE
-                // glyph afterwards so its directional state stays crisp.
-                draw_geodata(
-                    &mut pass,
-                    &self.preview.geodata_selection_pipeline,
-                    &self.selection_mesh,
-                    &self.preview.camera_bind_group,
-                    false,
-                );
+                // The selected cells already use yellow in the base geodata
+                // mesh. Draw only their NSWE glyphs over that same surface.
                 if self.ui.show_nswe_icons {
                     draw_nswe_icons(
                         &mut pass,
@@ -1259,12 +1264,31 @@ impl EditorView {
             });
         self.ui.selected.layer = self.ui.visible_layer;
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("Pincel");
-            for radius in [1, 2, 4, 8] {
-                ui.selectable_value(&mut self.ui.brush_radius, radius, radius.to_string());
-            }
-        });
+        egui::Grid::new("editor_selection_brush")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Pincel X");
+                ui.add(
+                    egui::DragValue::new(&mut self.ui.brush_width)
+                        .clamp_range(1..=256)
+                        .speed(1),
+                );
+                ui.end_row();
+                ui.label("Pincel Y");
+                ui.add(
+                    egui::DragValue::new(&mut self.ui.brush_height)
+                        .clamp_range(1..=256)
+                        .speed(1),
+                );
+                ui.end_row();
+            });
+        ui.small(format!(
+            "Clique no centro para selecionar {} × {} = {} células.",
+            self.ui.brush_width,
+            self.ui.brush_height,
+            self.ui.brush_width * self.ui.brush_height,
+        ));
         ui.horizontal(|ui| {
             ui.label("Detalhe L2J");
             for stride in [1, 2, 4, 8] {
@@ -1707,23 +1731,39 @@ impl EditorView {
         if !self.ui.selection.is_empty() {
             return self.ui.selection.clone();
         }
-        let radius = self.ui.brush_radius.max(1) - 1;
-        let mut result = Vec::new();
-        for x in self.ui.selected.x.saturating_sub(radius)..=(self.ui.selected.x + radius).min(2047)
-        {
-            for y in
-                self.ui.selected.y.saturating_sub(radius)..=(self.ui.selected.y + radius).min(2047)
-            {
-                if let Some(count) = self.document.layer_count(x, y) {
-                    result.push(LayerAddress::new(
-                        x,
-                        y,
-                        self.ui.visible_layer.min(count.saturating_sub(1)),
-                    ));
-                }
-            }
+        vec![LayerAddress::new(
+            self.ui.selected.x,
+            self.ui.selected.y,
+            self.ui.visible_layer,
+        )]
+    }
+
+    fn select_brush_area(&mut self, center: LayerAddress) {
+        let selection = brush_area_selection(
+            &self.document,
+            center,
+            self.ui.brush_width,
+            self.ui.brush_height,
+            self.ui.hide_fully_open_blocks,
+        );
+        if selection.is_empty() {
+            self.ui.status = "O pincel não encontrou células editáveis nessa área.".into();
+            return;
         }
-        result
+        self.ui.selected = center;
+        self.ui.visible_layer = center.layer;
+        self.ui.selection = selection;
+        self.ui.selection_hidden = false;
+        self.ui.rectangle_start = None;
+        self.ui.line_start = None;
+        self.ui.height_input_address = None;
+        self.ui.status = format!(
+            "Área {} × {} selecionada: {} células.",
+            self.ui.brush_width,
+            self.ui.brush_height,
+            self.ui.selection.len(),
+        );
+        self.refresh_editor_meshes();
     }
 
     fn select_current_block_cells(&mut self) -> usize {
@@ -1891,22 +1931,21 @@ impl EditorView {
         self.ui.rectangle_start = None;
         self.ui.line_start = None;
         self.ui.pending_plain_selection = false;
-        self.refresh_selection_mesh();
+        self.refresh_editor_meshes();
         self.ui.status = "Seleção removida.".into();
-    }
-
-    fn active_selection(&self) -> Vec<LayerAddress> {
-        editor_active_selection(&self.ui)
     }
 
     fn refresh_editor_meshes(&mut self) {
         let origin = map_origin(self.preview.source_map.bounds);
+        let active_selection = editor_active_selection(&self.ui);
+        let selection_lookup = EditorSelectionLookup::new(&self.document, &active_selection);
         let mesh = editor_geodata_instances(
             &self.preview.source_map,
             &self.document,
             origin,
             self.ui.visual_stride,
             EditorOverlayOptions::from_ui(&self.ui),
+            &selection_lookup,
         );
         self.geodata_mesh = GeodataInstances::new(&self.preview.device, &mesh);
         let icons = editor_nswe_icon_instances(
@@ -1915,21 +1954,9 @@ impl EditorView {
             origin,
             self.ui.visual_stride,
             EditorOverlayOptions::from_ui(&self.ui),
+            &selection_lookup,
         );
         self.nswe_icon_mesh = NsweIconInstances::new(&self.preview.device, &icons);
-        self.refresh_selection_mesh();
-    }
-
-    fn refresh_selection_mesh(&mut self) {
-        let origin = map_origin(self.preview.source_map.bounds);
-        let mesh = editor_selection_instances(
-            &self.preview.source_map,
-            &self.document,
-            origin,
-            &self.active_selection(),
-            self.ui.hide_fully_open_blocks,
-        );
-        self.selection_mesh = GeodataInstances::new(&self.preview.device, &mesh);
     }
 
     fn pick(&self) -> Option<LayerAddress> {
@@ -2078,6 +2105,42 @@ impl EditorView {
         );
         self.refresh_editor_meshes();
     }
+}
+fn centered_axis_bounds(center: usize, requested_size: usize) -> (usize, usize) {
+    let size = requested_size.clamp(1, 256).min(l2j::MAP_CELLS);
+    let start = center.saturating_sub(size / 2).min(l2j::MAP_CELLS - size);
+    (start, start + size)
+}
+
+fn brush_area_selection(
+    document: &Document,
+    center: LayerAddress,
+    width: usize,
+    height: usize,
+    hide_fully_open_cells: bool,
+) -> Vec<LayerAddress> {
+    let (start_x, end_x) = centered_axis_bounds(center.x, width);
+    let (start_y, end_y) = centered_axis_bounds(center.y, height);
+    let mut selection = Vec::with_capacity((end_x - start_x) * (end_y - start_y));
+    for y in start_y..end_y {
+        for x in start_x..end_x {
+            let Some(layer_count) = document.layer_count(x, y) else {
+                continue;
+            };
+            if layer_count == 0 {
+                continue;
+            }
+            let address = LayerAddress::new(x, y, center.layer.min(layer_count - 1));
+            let Some(layer) = document.cell(address) else {
+                continue;
+            };
+            if layer.height == NULL_HEIGHT || hide_fully_open_cells && layer_is_fully_open(layer) {
+                continue;
+            }
+            selection.push(address);
+        }
+    }
+    selection
 }
 
 /// Bresenham over the L2J grid, inclusive at both ends. It is used when no
@@ -2555,60 +2618,13 @@ fn block_is_fully_open(document: &Document, block_x: usize, block_y: usize) -> b
     has_surface
 }
 
-fn editor_selection_footprint(
-    document: &Document,
-    address: LayerAddress,
-) -> (usize, usize, f32, bool) {
-    let block_x = address.x / 8;
-    let block_y = address.y / 8;
-    if document.block_type(block_x, block_y) == Some(EditableBlockType::Simple) {
-        (block_x * 8, block_y * 8, 63.4, true)
-    } else {
-        (address.x, address.y, 7.35, false)
-    }
-}
-
-fn editor_selection_instances(
-    map: &SourceMap,
-    document: &Document,
-    origin: Vec3,
-    selection: &[LayerAddress],
-    hide_fully_open_blocks: bool,
-) -> CpuGeodata {
-    let mut mesh = CpuGeodata::default();
-    let mut selected_simple_blocks = HashSet::new();
-    for address in selection {
-        let Some(cell) = document.cell(*address) else {
-            continue;
-        };
-        if cell.height == NULL_HEIGHT || hide_fully_open_blocks && layer_is_fully_open(cell) {
-            continue;
-        }
-        let (x, y, scale, is_simple) = editor_selection_footprint(document, *address);
-        if is_simple && !selected_simple_blocks.insert((x / 8, y / 8)) {
-            continue;
-        }
-        mesh.instances.push(GeodataInstance {
-            position: [
-                map.bounds.min.x + x as f32 * 16.0 + scale - origin.x,
-                // Match the coloured cell plane with only enough separation
-                // to avoid depth fighting; the higher NSWE glyph stays clear.
-                cell.height as f32 - origin.y + 1.4,
-                map.bounds.min.z + y as f32 * 16.0 + scale - origin.z,
-            ],
-            scale,
-            color: [255, 235, 0, 255],
-        });
-    }
-    mesh
-}
-
 fn editor_geodata_instances(
     map: &SourceMap,
     document: &Document,
     origin: Vec3,
     stride: usize,
     visibility: EditorOverlayOptions,
+    selection: &EditorSelectionLookup,
 ) -> CpuGeodata {
     let mut mesh = CpuGeodata::default();
     let stride = stride.max(1);
@@ -2621,13 +2637,15 @@ fn editor_geodata_instances(
             }
             match document.block_type(block_x, block_y) {
                 Some(EditableBlockType::Simple) => {
-                    if !visibility.shows_layer(0) || !visibility.shows_open_block(start_x, start_y)
+                    let selected = selection.contains_simple_block(block_x, block_y);
+                    if !visibility.shows_layer(0)
+                        || !selected && !visibility.shows_open_block(start_x, start_y)
                     {
                         continue;
                     }
                     if let Some(layer) = document.cell(LayerAddress::new(start_x, start_y, 0)) {
                         append_editor_geodata_cell(
-                            &mut mesh, map, origin, start_x, start_y, layer, 63.4,
+                            &mut mesh, map, origin, start_x, start_y, layer, 63.4, selected,
                         );
                     }
                 }
@@ -2642,17 +2660,18 @@ fn editor_geodata_instances(
                                 if !visibility.shows_layer(layer) {
                                     continue;
                                 }
-                                if let Some(layer) = document.cell(LayerAddress::new(x, y, layer)) {
-                                    // Sampling may simplify large open areas,
-                                    // but never hide a partial or blocked
-                                    // location.  Those are exactly the cells
-                                    // an editor user needs to find and fix.
-                                    let is_open = layer_is_fully_open(layer);
+                                if let Some(cell) = document.cell(LayerAddress::new(x, y, layer)) {
+                                    let selected = selection.contains_cell(x, y, layer);
+                                    let is_open = layer_is_fully_open(cell);
+                                    let sampled_area_selected =
+                                        selection.sampled_area_contains_cell(x, y, layer, stride);
                                     if is_open
                                         && (visibility.hide_fully_open_blocks
-                                            || !visibility.shows_open_cell(x, y)
-                                            || x % stride != 0
-                                            || y % stride != 0)
+                                            || !selected
+                                                && (!visibility.shows_open_cell(x, y)
+                                                    || x % stride != 0
+                                                    || y % stride != 0
+                                                    || sampled_area_selected))
                                     {
                                         continue;
                                     }
@@ -2662,8 +2681,13 @@ fn editor_geodata_instances(
                                         origin,
                                         x,
                                         y,
-                                        layer,
-                                        if is_open { sampled_scale } else { 7.35 },
+                                        cell,
+                                        if is_open && !selected {
+                                            sampled_scale
+                                        } else {
+                                            7.35
+                                        },
+                                        selected,
                                     );
                                 }
                             }
@@ -2687,6 +2711,7 @@ fn editor_nswe_icon_instances(
     origin: Vec3,
     stride: usize,
     visibility: EditorOverlayOptions,
+    selection: &EditorSelectionLookup,
 ) -> CpuNsweIcons {
     let mut mesh = CpuNsweIcons::default();
     let stride = stride.max(1);
@@ -2701,7 +2726,10 @@ fn editor_nswe_icon_instances(
                 // Simple is one authored 8×8 surface, so it receives one
                 // equally unified glyph instead of 64 repeated cell icons.
                 Some(EditableBlockType::Simple) => {
-                    if visibility.shows_layer(0) && visibility.shows_open_block(start_x, start_y) {
+                    let selected = selection.contains_simple_block(block_x, block_y);
+                    if visibility.shows_layer(0)
+                        && (selected || visibility.shows_open_block(start_x, start_y))
+                    {
                         if let Some(layer) = document.cell(LayerAddress::new(start_x, start_y, 0)) {
                             append_editor_nswe_icon(
                                 &mut mesh, map, origin, start_x, start_y, layer, 63.4,
@@ -2725,12 +2753,17 @@ fn editor_nswe_icon_instances(
                                 else {
                                     continue;
                                 };
+                                let selected = selection.contains_cell(x, y, layer_index);
                                 let is_open = layer_is_fully_open(layer);
+                                let sampled_area_selected =
+                                    selection.sampled_area_contains_cell(x, y, layer_index, stride);
                                 if is_open
                                     && (visibility.hide_fully_open_blocks
-                                        || !visibility.shows_open_cell(x, y)
-                                        || x % stride != 0
-                                        || y % stride != 0)
+                                        || !selected
+                                            && (!visibility.shows_open_cell(x, y)
+                                                || x % stride != 0
+                                                || y % stride != 0
+                                                || sampled_area_selected))
                                 {
                                     continue;
                                 }
@@ -2741,7 +2774,11 @@ fn editor_nswe_icon_instances(
                                     x,
                                     y,
                                     layer,
-                                    if is_open { sampled_scale } else { 7.35 },
+                                    if is_open && !selected {
+                                        sampled_scale
+                                    } else {
+                                        7.35
+                                    },
                                 );
                             }
                         }
@@ -2928,6 +2965,7 @@ fn append_editor_geodata_cell(
     y: usize,
     cell: Layer,
     scale: f32,
+    selected: bool,
 ) {
     if cell.height == NULL_HEIGHT {
         return;
@@ -2939,11 +2977,14 @@ fn append_editor_geodata_cell(
             map.bounds.min.z + y as f32 * 16.0 + scale - origin.z,
         ],
         scale,
-        color: editor_cell_color(cell),
+        color: editor_cell_color(cell, selected),
     });
 }
 
-fn editor_cell_color(cell: Layer) -> [u8; 4] {
+fn editor_cell_color(cell: Layer, selected: bool) -> [u8; 4] {
+    if selected {
+        return [255, 235, 0, 255];
+    }
     match (cell.nswe & 0x0f).count_ones() {
         4 => [0, 205, 230, 165],
         0 => [235, 45, 45, 230],
@@ -2986,7 +3027,7 @@ impl Vertex {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CpuMesh {
     vertices: Vec<Vertex>,
     triangles: Vec<u32>,
@@ -3000,7 +3041,6 @@ struct GpuMesh {
     triangle_count: u32,
     line_count: u32,
 }
-
 impl GpuMesh {
     fn new(device: &wgpu::Device, mesh: &CpuMesh) -> Self {
         let cpu_vertices = if mesh.vertices.is_empty() {
@@ -3750,26 +3790,24 @@ fn create_geodata_pipelines(
     )
 }
 
-/// Editor-only L2J surface pipeline. Both the coloured overlay and the
-/// selection border write depth so only the frontmost layer remains visible.
-fn create_geodata_editor_pipeline(
+/// Editor-only L2J overlay. Selected cells use a different instance colour in
+/// this same pipeline, so no competing surface or depth offset is required.
+fn create_geodata_overlay_pipeline(
     device: &wgpu::Device,
     camera_layout: &wgpu::BindGroupLayout,
     format: wgpu::TextureFormat,
-    label: &'static str,
-    fragment_entry: &'static str,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
+        label: Some("geodata-editor-overlay"),
         source: wgpu::ShaderSource::Wgsl(GEODATA_SHADER.into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(label),
+        label: Some("geodata-editor-overlay"),
         bind_group_layouts: &[camera_layout],
         push_constant_ranges: &[],
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(label),
+        label: Some("geodata-editor-overlay"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -3778,7 +3816,7 @@ fn create_geodata_editor_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: fragment_entry,
+            entry_point: "fs_main",
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -4143,8 +4181,6 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
-    @location(1) offset: vec2<f32>,
-    @location(2) scale: f32,
 };
 
 @vertex
@@ -4153,8 +4189,6 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let point = input.position + vec3<f32>(input.offset.x * input.scale, 0.0, input.offset.y * input.scale);
     output.position = camera.view_projection * vec4<f32>(point, 1.0);
     output.color = input.color;
-    output.offset = input.offset;
-    output.scale = input.scale;
     return output;
 }
 
@@ -4163,16 +4197,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(srgb_to_linear(input.color.rgb), input.color.a);
 }
 
-@fragment
-fn fs_selection(input: VertexOutput) -> @location(0) vec4<f32> {
-    let edge_distance = (1.0 - max(abs(input.offset.x), abs(input.offset.y))) * input.scale;
-    let black = vec3<f32>(0.015, 0.015, 0.015);
-    let yellow = srgb_to_linear(input.color.rgb);
-    let is_border = edge_distance <= 0.45;
-    let color = select(yellow, black, is_border);
-    let alpha = select(0.94, 1.0, is_border);
-    return vec4<f32>(color, alpha);
-}
 
 fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
     let lower = color / vec3<f32>(12.92);
@@ -4237,23 +4261,19 @@ mod tests {
 
     #[test]
     fn editor_cells_and_selection_use_high_visibility_colours() {
+        let open = Layer {
+            height: 0,
+            nswe: Layer::OPEN,
+        };
+        assert_eq!(editor_cell_color(open, false), [0, 205, 230, 165]);
         assert_eq!(
-            editor_cell_color(Layer {
-                height: 0,
-                nswe: 15
-            }),
-            [0, 205, 230, 165]
-        );
-        assert_eq!(
-            editor_cell_color(Layer { height: 0, nswe: 0 }),
+            editor_cell_color(Layer { height: 0, nswe: 0 }, false),
             [235, 45, 45, 230]
         );
-        assert!(
-            editor_cell_color(Layer {
-                height: 0,
-                nswe: 15
-            })[3]
-                > 100
+        assert_eq!(editor_cell_color(open, true), [255, 235, 0, 255]);
+        assert_eq!(
+            editor_cell_color(Layer { height: 0, nswe: 0 }, true),
+            [255, 235, 0, 255]
         );
     }
     #[test]
@@ -4272,20 +4292,39 @@ mod tests {
     }
 
     #[test]
-    fn simple_selection_uses_the_whole_eight_by_eight_block_footprint() {
+    fn rectangular_brush_selects_exact_configured_area_around_click() {
+        let document = Document::blank();
+        let center = LayerAddress::new(100, 200, 0);
+
+        assert_eq!(centered_axis_bounds(center.x, 10), (95, 105));
+        assert_eq!(centered_axis_bounds(center.y, 4), (198, 202));
+
+        let selection = brush_area_selection(&document, center, 10, 4, false);
+        assert_eq!(selection.len(), 40);
+        assert!(
+            selection
+                .iter()
+                .all(|cell| { (95..105).contains(&cell.x) && (198..202).contains(&cell.y) })
+        );
+
+        assert_eq!(centered_axis_bounds(0, 10), (0, 10));
+        assert_eq!(centered_axis_bounds(2047, 4), (2044, 2048));
+    }
+
+    #[test]
+    fn simple_selection_colours_the_whole_authored_block() {
         let mut document = Document::blank();
         let address = LayerAddress::new(13, 22, 0);
+        let lookup = EditorSelectionLookup::new(&document, &[address]);
 
-        assert_eq!(
-            editor_selection_footprint(&document, address),
-            (8, 16, 63.4, true)
-        );
+        assert!(lookup.contains_simple_block(1, 2));
+        assert!(!lookup.contains_cell(13, 22, 0));
 
         document.convert_simple_to_complex(1, 2).unwrap();
-        assert_eq!(
-            editor_selection_footprint(&document, address),
-            (13, 22, 7.35, false)
-        );
+        let lookup = EditorSelectionLookup::new(&document, &[address]);
+
+        assert!(!lookup.contains_simple_block(1, 2));
+        assert!(lookup.contains_cell(13, 22, 0));
     }
     #[test]
     fn fully_open_filter_hides_only_blocks_without_restrictions() {
