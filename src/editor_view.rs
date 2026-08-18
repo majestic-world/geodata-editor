@@ -143,6 +143,7 @@ struct Preview {
     line_pipeline: wgpu::RenderPipeline,
     geodata_line_pipeline: wgpu::RenderPipeline,
     geodata_overlay_pipeline: wgpu::RenderPipeline,
+    geodata_selection_pipeline: wgpu::RenderPipeline,
     nswe_icon_pipeline: wgpu::RenderPipeline,
     nswe_icon_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
@@ -260,8 +261,20 @@ impl Preview {
             create_pipelines(&device, &camera_layout, format);
         let (_, _, geodata_line_pipeline) =
             create_geodata_pipelines(&device, &camera_layout, format);
-        let geodata_overlay_pipeline =
-            create_geodata_overlay_pipeline(&device, &camera_layout, format);
+        let geodata_overlay_pipeline = create_geodata_editor_pipeline(
+            &device,
+            &camera_layout,
+            format,
+            "geodata-editor-overlay",
+            "fs_main",
+        );
+        let geodata_selection_pipeline = create_geodata_editor_pipeline(
+            &device,
+            &camera_layout,
+            format,
+            "geodata-editor-selection",
+            "fs_selection",
+        );
         let (nswe_icon_pipeline, nswe_icon_bind_group) =
             create_nswe_icon_resources(&device, &queue, &camera_layout, format);
         let depth_view = create_depth_view(&device, &config);
@@ -294,6 +307,7 @@ impl Preview {
             line_pipeline,
             geodata_line_pipeline,
             geodata_overlay_pipeline,
+            geodata_selection_pipeline,
             nswe_icon_pipeline,
             nswe_icon_bind_group,
             camera_buffer,
@@ -806,9 +820,11 @@ impl EditorView {
                         &self.preview.nswe_icon_bind_group,
                     );
                 }
+                // Draw a broad, two-tone border in the cell plane. The center
+                // remains transparent, preserving both colour and NSWE glyph.
                 draw_geodata(
                     &mut pass,
-                    &self.preview.geodata_overlay_pipeline,
+                    &self.preview.geodata_selection_pipeline,
                     &self.selection_mesh,
                     &self.preview.camera_bind_group,
                     false,
@@ -2278,16 +2294,16 @@ fn editor_selection_instances(
         if cell.height == NULL_HEIGHT {
             continue;
         }
+        let scale = 7.35;
         mesh.instances.push(GeodataInstance {
             position: [
-                map.bounds.min.x + address.x as f32 * 16.0 + 7.5 - origin.x,
-                // It is deliberately above both source geometry and the L2J
-                // overlay: a picked cell must remain unmistakable from any
-                // camera angle.
-                cell.height as f32 - origin.y + 6.0,
-                map.bounds.min.z + address.y as f32 * 16.0 + 7.5 - origin.z,
+                map.bounds.min.x + address.x as f32 * 16.0 + scale - origin.x,
+                // Match the coloured cell plane with only enough separation
+                // to avoid depth fighting; the higher NSWE glyph stays clear.
+                cell.height as f32 - origin.y + 1.4,
+                map.bounds.min.z + address.y as f32 * 16.0 + scale - origin.z,
             ],
-            scale: 7.85,
+            scale,
             color: [255, 235, 0, 255],
         });
     }
@@ -3375,25 +3391,26 @@ fn create_geodata_pipelines(
     )
 }
 
-/// Editor-only L2J overlay. It writes depth so the editor shows the first
-/// surface facing the camera instead of blending every floor and ceiling in a
-/// multilayer area into the same view.
-fn create_geodata_overlay_pipeline(
+/// Editor-only L2J surface pipeline. Both the coloured overlay and the
+/// selection border write depth so only the frontmost layer remains visible.
+fn create_geodata_editor_pipeline(
     device: &wgpu::Device,
     camera_layout: &wgpu::BindGroupLayout,
     format: wgpu::TextureFormat,
+    label: &'static str,
+    fragment_entry: &'static str,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("geodata-editor-overlay-shader"),
+        label: Some(label),
         source: wgpu::ShaderSource::Wgsl(GEODATA_SHADER.into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("geodata-editor-overlay-layout"),
+        label: Some(label),
         bind_group_layouts: &[camera_layout],
         push_constant_ranges: &[],
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("geodata-editor-overlay"),
+        label: Some(label),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -3402,7 +3419,7 @@ fn create_geodata_overlay_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_main",
+            entry_point: fragment_entry,
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -3767,6 +3784,7 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) offset: vec2<f32>,
 };
 
 @vertex
@@ -3775,12 +3793,25 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let point = input.position + vec3<f32>(input.offset.x * input.scale, 0.0, input.offset.y * input.scale);
     output.position = camera.view_projection * vec4<f32>(point, 1.0);
     output.color = input.color;
+    output.offset = input.offset;
     return output;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(srgb_to_linear(input.color.rgb), input.color.a);
+}
+
+@fragment
+fn fs_selection(input: VertexOutput) -> @location(0) vec4<f32> {
+    let edge_distance = 1.0 - max(abs(input.offset.x), abs(input.offset.y));
+    if edge_distance > 0.22 {
+        discard;
+    }
+    let black = vec3<f32>(0.015, 0.015, 0.015);
+    let yellow = srgb_to_linear(input.color.rgb);
+    let is_yellow = edge_distance >= 0.045 && edge_distance <= 0.175;
+    return vec4<f32>(select(black, yellow, is_yellow), 1.0);
 }
 
 fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
