@@ -461,11 +461,9 @@ impl Document {
         result
     }
 
-    /// Applies an explicit editor override. Unlike [`Self::set_nswe`], an open
-    /// bit is kept even when there is no neighbour within the normal climb
-    /// threshold (or at the edge of a map). When a neighbouring layer exists,
-    /// its opposite bit is mirrored using the closest height. This is intended
-    /// for manual corrections imported from existing geodata editors.
+    /// Applies an exact editor override only to the explicitly addressed
+    /// layers. Unlike [`Self::set_nswe`], it neither validates climb limits nor
+    /// mirrors opposite bits into neighbouring, unselected cells.
     pub fn force_set_nswe(
         &mut self,
         targets: impl IntoIterator<Item = LayerAddress>,
@@ -906,43 +904,6 @@ impl Document {
                 .is_ok()
             {
                 result.changed_cells += 1;
-            }
-        }
-
-        for direction in Direction::ALL {
-            let Some((nx, ny)) = neighbour(target.x, target.y, direction) else {
-                // The explicit mask is intentionally preserved at map edges.
-                continue;
-            };
-            let (neighbour_block, neighbour_column) =
-                cell_location(nx, ny).expect("neighbour was bounds checked");
-            let Some(neighbour_layer) =
-                self.find_nearest_layer(neighbour_block, neighbour_column, layer.height)
-            else {
-                continue;
-            };
-            let old = self.blocks[neighbour_block]
-                .current
-                .layer(neighbour_column, neighbour_layer)
-                .map(|layer| layer.nswe)
-                .unwrap_or(0);
-            let new = if requested & direction.bit() != 0 {
-                old | direction.opposite().bit()
-            } else {
-                old & !direction.opposite().bit()
-            };
-            if old != new {
-                self.snapshot(before, neighbour_block);
-                if self.blocks[neighbour_block].current.promote_to_complex() {
-                    result.promoted_blocks += 1;
-                }
-                if self.blocks[neighbour_block]
-                    .current
-                    .set_layer_nswe(neighbour_column, neighbour_layer, new)
-                    .is_ok()
-                {
-                    result.changed_links += 1;
-                }
             }
         }
     }
@@ -1532,21 +1493,29 @@ mod tests {
         );
     }
     #[test]
-    fn explicit_open_override_keeps_all_four_sides_and_mirrors_nearest_layer() {
-        let mut document = Document::from_bytes(first_complex_then_simple()).unwrap();
-        let target = LayerAddress::new(0, 0, 0);
-        document.set_nswe([target], 0, "bloquear");
-        let result = document.force_set_nswe([target], Layer::OPEN, "liberar 100%");
+    fn explicit_override_changes_only_the_selected_row() {
+        let mut document = Document::from_bytes(simple_file(32)).unwrap();
+        let selected = (0..8)
+            .map(|x| LayerAddress::new(x, 1, 0))
+            .collect::<Vec<_>>();
+        let untouched = (0..8)
+            .flat_map(|x| [LayerAddress::new(x, 0, 0), LayerAddress::new(x, 2, 0)])
+            .collect::<Vec<_>>();
 
-        assert_eq!(document.cell(target).unwrap().nswe, Layer::OPEN);
-        assert_ne!(result.changed_cells, 0);
-        // The east neighbour is 100 units above and is deliberately outside
-        // the normal climb threshold. The explicit editor action still
-        // mirrors it, making the authored override symmetric.
-        assert_ne!(
-            document.cell(LayerAddress::new(1, 0, 0)).unwrap().nswe & Direction::West.bit(),
-            0
+        let result = document.force_set_nswe(
+            selected.iter().copied(),
+            Direction::West.bit() | Direction::East.bit(),
+            "corredor horizontal",
         );
+
+        for address in selected {
+            assert_eq!(document.cell(address).unwrap().nswe, 0b0011);
+        }
+        for address in untouched {
+            assert_eq!(document.cell(address).unwrap().nswe, Layer::OPEN);
+        }
+        assert_eq!(result.changed_cells, 8);
+        assert_eq!(result.changed_links, 0);
     }
     #[test]
     fn save_as_can_replace_the_opened_file_after_creating_a_backup() {

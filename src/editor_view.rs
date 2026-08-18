@@ -1432,7 +1432,7 @@ impl EditorView {
         let result = self
             .document
             .force_set_nswe(targets, mask, format!("Preset NSWE {mask:04b}"));
-        if result.changed_cells == 0 && result.changed_links == 0 {
+        if result.changed_cells == 0 {
             self.ui.status = if result.rejected_links.is_empty() {
                 "As células selecionadas já usavam esse preset.".into()
             } else {
@@ -1440,8 +1440,8 @@ impl EditorView {
             };
         } else {
             self.after_edit(&format!(
-                "Preset NSWE {mask:04b} aplicado: {} células, {} ligações.",
-                result.changed_cells, result.changed_links,
+                "Preset NSWE {mask:04b} aplicado em {} células selecionadas.",
+                result.changed_cells,
             ));
         }
     }
