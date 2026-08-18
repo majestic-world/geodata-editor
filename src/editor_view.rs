@@ -506,6 +506,32 @@ struct EditorView {
     nswe_icons: [egui::TextureHandle; 16],
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BrushAnchor {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
+
+impl BrushAnchor {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Esquerda",
+            Self::Center => "Centro",
+            Self::Right => "Direita",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Left => "O clique inicia à esquerda; a área cresce para a direita e para cima.",
+            Self::Center => "A área é distribuída ao redor da célula clicada.",
+            Self::Right => "O clique termina à direita; a área cresce para a esquerda e para cima.",
+        }
+    }
+}
+
 #[derive(Default)]
 struct EditorUi {
     open_path: String,
@@ -520,6 +546,7 @@ struct EditorUi {
     visible_layer: usize,
     brush_width: usize,
     brush_height: usize,
+    brush_anchor: BrushAnchor,
     visual_stride: usize,
     show_nswe_icons: bool,
     show_selected_layer_only: bool,
@@ -1282,12 +1309,22 @@ impl EditorView {
                         .speed(1),
                 );
                 ui.end_row();
+                ui.label("Origem");
+                egui::ComboBox::from_id_source("editor_brush_anchor")
+                    .selected_text(self.ui.brush_anchor.label())
+                    .show_ui(ui, |ui| {
+                        for anchor in [BrushAnchor::Left, BrushAnchor::Center, BrushAnchor::Right] {
+                            ui.selectable_value(&mut self.ui.brush_anchor, anchor, anchor.label());
+                        }
+                    });
+                ui.end_row();
             });
         ui.small(format!(
-            "Clique no centro para selecionar {} × {} = {} células.",
+            "{} × {} = {} células. {}",
             self.ui.brush_width,
             self.ui.brush_height,
             self.ui.brush_width * self.ui.brush_height,
+            self.ui.brush_anchor.description(),
         ));
         ui.horizontal(|ui| {
             ui.label("Detalhe L2J");
@@ -1744,6 +1781,7 @@ impl EditorView {
             center,
             self.ui.brush_width,
             self.ui.brush_height,
+            self.ui.brush_anchor,
             self.ui.hide_fully_open_blocks,
         );
         if selection.is_empty() {
@@ -1758,9 +1796,10 @@ impl EditorView {
         self.ui.line_start = None;
         self.ui.height_input_address = None;
         self.ui.status = format!(
-            "Área {} × {} selecionada: {} células.",
+            "Área {} × {} ({}) selecionada: {} células.",
             self.ui.brush_width,
             self.ui.brush_height,
+            self.ui.brush_anchor.label(),
             self.ui.selection.len(),
         );
         self.refresh_editor_meshes();
@@ -2106,10 +2145,26 @@ impl EditorView {
         self.refresh_editor_meshes();
     }
 }
+fn brush_size(requested_size: usize) -> usize {
+    requested_size.clamp(1, 256).min(l2j::MAP_CELLS)
+}
+
 fn centered_axis_bounds(center: usize, requested_size: usize) -> (usize, usize) {
-    let size = requested_size.clamp(1, 256).min(l2j::MAP_CELLS);
+    let size = brush_size(requested_size);
     let start = center.saturating_sub(size / 2).min(l2j::MAP_CELLS - size);
     (start, start + size)
+}
+
+fn forward_axis_bounds(start_pointer: usize, requested_size: usize) -> (usize, usize) {
+    let size = brush_size(requested_size);
+    let start = start_pointer.min(l2j::MAP_CELLS - size);
+    (start, start + size)
+}
+
+fn backward_axis_bounds(end_pointer: usize, requested_size: usize) -> (usize, usize) {
+    let size = brush_size(requested_size);
+    let end = end_pointer.saturating_add(1).max(size).min(l2j::MAP_CELLS);
+    (end - size, end)
 }
 
 fn brush_area_selection(
@@ -2117,10 +2172,23 @@ fn brush_area_selection(
     center: LayerAddress,
     width: usize,
     height: usize,
+    anchor: BrushAnchor,
     hide_fully_open_cells: bool,
 ) -> Vec<LayerAddress> {
-    let (start_x, end_x) = centered_axis_bounds(center.x, width);
-    let (start_y, end_y) = centered_axis_bounds(center.y, height);
+    let ((start_x, end_x), (start_y, end_y)) = match anchor {
+        BrushAnchor::Left => (
+            forward_axis_bounds(center.x, width),
+            backward_axis_bounds(center.y, height),
+        ),
+        BrushAnchor::Center => (
+            centered_axis_bounds(center.x, width),
+            centered_axis_bounds(center.y, height),
+        ),
+        BrushAnchor::Right => (
+            backward_axis_bounds(center.x, width),
+            backward_axis_bounds(center.y, height),
+        ),
+    };
     let mut selection = Vec::with_capacity((end_x - start_x) * (end_y - start_y));
     for y in start_y..end_y {
         for x in start_x..end_x {
@@ -4299,7 +4367,7 @@ mod tests {
         assert_eq!(centered_axis_bounds(center.x, 10), (95, 105));
         assert_eq!(centered_axis_bounds(center.y, 4), (198, 202));
 
-        let selection = brush_area_selection(&document, center, 10, 4, false);
+        let selection = brush_area_selection(&document, center, 10, 4, BrushAnchor::Center, false);
         assert_eq!(selection.len(), 40);
         assert!(
             selection
@@ -4309,6 +4377,29 @@ mod tests {
 
         assert_eq!(centered_axis_bounds(0, 10), (0, 10));
         assert_eq!(centered_axis_bounds(2047, 4), (2044, 2048));
+    }
+
+    #[test]
+    fn directional_brush_uses_clicked_cell_as_requested_pointer() {
+        let document = Document::blank();
+        let pointer = LayerAddress::new(100, 200, 0);
+
+        let from_left = brush_area_selection(&document, pointer, 20, 10, BrushAnchor::Left, false);
+        assert_eq!(from_left.len(), 200);
+        assert!(
+            from_left
+                .iter()
+                .all(|cell| { (100..120).contains(&cell.x) && (191..201).contains(&cell.y) })
+        );
+
+        let from_right =
+            brush_area_selection(&document, pointer, 20, 10, BrushAnchor::Right, false);
+        assert_eq!(from_right.len(), 200);
+        assert!(
+            from_right
+                .iter()
+                .all(|cell| { (81..101).contains(&cell.x) && (191..201).contains(&cell.y) })
+        );
     }
 
     #[test]
