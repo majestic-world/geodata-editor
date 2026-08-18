@@ -419,6 +419,7 @@ struct EditorUi {
     show_nswe_icons: bool,
     show_selected_layer_only: bool,
     show_all_open_cells: bool,
+    hide_fully_open_blocks: bool,
     open_context_radius: usize,
     height_input: i32,
     height_input_address: Option<LayerAddress>,
@@ -445,6 +446,7 @@ struct EditorOverlayOptions {
     selected: LayerAddress,
     open_context_radius: usize,
     show_all_open_cells: bool,
+    hide_fully_open_blocks: bool,
     show_selected_layer_only: bool,
 }
 
@@ -454,6 +456,7 @@ impl EditorOverlayOptions {
             selected: ui.selected,
             open_context_radius: ui.open_context_radius,
             show_all_open_cells: ui.show_all_open_cells,
+            hide_fully_open_blocks: ui.hide_fully_open_blocks,
             show_selected_layer_only: ui.show_selected_layer_only,
         }
     }
@@ -470,6 +473,10 @@ impl EditorOverlayOptions {
                 && start_x + 7 >= self.selected.x.saturating_sub(self.open_context_radius)
                 && start_y <= self.selected.y.saturating_add(self.open_context_radius)
                 && start_y + 7 >= self.selected.y.saturating_sub(self.open_context_radius)
+    }
+
+    fn hides_block(self, document: &Document, block_x: usize, block_y: usize) -> bool {
+        self.hide_fully_open_blocks && block_is_fully_open(document, block_x, block_y)
     }
 
     fn shows_layer(self, layer: usize) -> bool {
@@ -623,6 +630,7 @@ impl EditorView {
                 &document,
                 origin,
                 &editor_active_selection(&ui),
+                ui.hide_fully_open_blocks,
             ),
         );
         let nswe_icons = load_nswe_icons(&preview.egui_context);
@@ -1310,23 +1318,37 @@ impl EditorView {
     fn draw_visualization_section(&mut self, ui: &mut egui::Ui, visual_changed: &mut bool) {
         *visual_changed |= ui
             .checkbox(
-                &mut self.ui.show_all_open_cells,
-                "Mostrar toda a geodata aberta",
+                &mut self.ui.hide_fully_open_blocks,
+                "Ocultar blocos 100% livres",
+            )
+            .on_hover_text(
+                "Oculta blocos Simple e todas as células sem qualquer direção bloqueada.",
             )
             .changed();
-        if !self.ui.show_all_open_cells {
-            ui.horizontal(|ui| {
-                ui.label("Contexto aberto");
-                for radius in [8, 16, 32, 64] {
-                    *visual_changed |= ui
-                        .selectable_value(
-                            &mut self.ui.open_context_radius,
-                            radius,
-                            radius.to_string(),
-                        )
-                        .changed();
-                }
-            });
+        ui.add_enabled_ui(!self.ui.hide_fully_open_blocks, |ui| {
+            *visual_changed |= ui
+                .checkbox(
+                    &mut self.ui.show_all_open_cells,
+                    "Mostrar toda a geodata aberta",
+                )
+                .changed();
+            if !self.ui.show_all_open_cells {
+                ui.horizontal(|ui| {
+                    ui.label("Contexto aberto");
+                    for radius in [8, 16, 32, 64] {
+                        *visual_changed |= ui
+                            .selectable_value(
+                                &mut self.ui.open_context_radius,
+                                radius,
+                                radius.to_string(),
+                            )
+                            .changed();
+                    }
+                });
+            }
+        });
+        if self.ui.hide_fully_open_blocks {
+            ui.small("Somente células com algum bloqueio permanecem visíveis.");
         }
         ui.add_space(4.0);
         ui.label(format!(
@@ -1691,6 +1713,7 @@ impl EditorView {
             &self.document,
             origin,
             &self.active_selection(),
+            self.ui.hide_fully_open_blocks,
         );
         self.selection_mesh = GeodataInstances::new(&self.preview.device, &mesh);
     }
@@ -1733,6 +1756,7 @@ impl EditorView {
             self.ui
                 .show_selected_layer_only
                 .then_some(self.ui.visible_layer),
+            self.ui.hide_fully_open_blocks,
         )
     }
 
@@ -2280,6 +2304,37 @@ fn pick_geodata_file(current: &str) -> Option<PathBuf> {
     dialog.pick_file()
 }
 
+fn layer_is_fully_open(layer: Layer) -> bool {
+    layer.height != NULL_HEIGHT && layer.nswe & 0x0f == Layer::OPEN
+}
+
+fn block_is_fully_open(document: &Document, block_x: usize, block_y: usize) -> bool {
+    let Some(block) = document.block(block_x, block_y) else {
+        return false;
+    };
+    if block.kind() == EditableBlockType::Simple {
+        return block
+            .layers(0)
+            .first()
+            .copied()
+            .is_some_and(layer_is_fully_open);
+    }
+
+    let mut has_surface = false;
+    for column in 0..l2j::COLUMNS_PER_BLOCK {
+        for layer in block.layers(column) {
+            if layer.height == NULL_HEIGHT {
+                continue;
+            }
+            has_surface = true;
+            if !layer_is_fully_open(*layer) {
+                return false;
+            }
+        }
+    }
+    has_surface
+}
+
 fn editor_selection_footprint(
     document: &Document,
     address: LayerAddress,
@@ -2298,6 +2353,7 @@ fn editor_selection_instances(
     document: &Document,
     origin: Vec3,
     selection: &[LayerAddress],
+    hide_fully_open_blocks: bool,
 ) -> CpuGeodata {
     let mut mesh = CpuGeodata::default();
     let mut selected_simple_blocks = HashSet::new();
@@ -2305,7 +2361,7 @@ fn editor_selection_instances(
         let Some(cell) = document.cell(*address) else {
             continue;
         };
-        if cell.height == NULL_HEIGHT {
+        if cell.height == NULL_HEIGHT || hide_fully_open_blocks && layer_is_fully_open(cell) {
             continue;
         }
         let (x, y, scale, is_simple) = editor_selection_footprint(document, *address);
@@ -2340,6 +2396,9 @@ fn editor_geodata_instances(
         for block_y in 0..256 {
             let start_x = block_x * 8;
             let start_y = block_y * 8;
+            if visibility.hides_block(document, block_x, block_y) {
+                continue;
+            }
             match document.block_type(block_x, block_y) {
                 Some(EditableBlockType::Simple) => {
                     if !visibility.shows_layer(0) || !visibility.shows_open_block(start_x, start_y)
@@ -2368,9 +2427,10 @@ fn editor_geodata_instances(
                                     // but never hide a partial or blocked
                                     // location.  Those are exactly the cells
                                     // an editor user needs to find and fix.
-                                    let is_open = layer.nswe & 0x0f == Layer::OPEN;
+                                    let is_open = layer_is_fully_open(layer);
                                     if is_open
-                                        && (!visibility.shows_open_cell(x, y)
+                                        && (visibility.hide_fully_open_blocks
+                                            || !visibility.shows_open_cell(x, y)
                                             || x % stride != 0
                                             || y % stride != 0)
                                     {
@@ -2414,6 +2474,9 @@ fn editor_nswe_icon_instances(
         for block_y in 0..256 {
             let start_x = block_x * 8;
             let start_y = block_y * 8;
+            if visibility.hides_block(document, block_x, block_y) {
+                continue;
+            }
             match document.block_type(block_x, block_y) {
                 // Simple is one authored 8×8 surface, so it receives one
                 // equally unified glyph instead of 64 repeated cell icons.
@@ -2442,9 +2505,10 @@ fn editor_nswe_icon_instances(
                                 else {
                                     continue;
                                 };
-                                let is_open = layer.nswe & 0x0f == Layer::OPEN;
+                                let is_open = layer_is_fully_open(layer);
                                 if is_open
-                                    && (!visibility.shows_open_cell(x, y)
+                                    && (visibility.hide_fully_open_blocks
+                                        || !visibility.shows_open_cell(x, y)
                                         || x % stride != 0
                                         || y % stride != 0)
                                 {
@@ -2509,6 +2573,7 @@ fn pick_l2j_ray(
     ray_origin: [f32; 3],
     ray: [f32; 3],
     layer_filter: Option<usize>,
+    hide_fully_open_blocks: bool,
 ) -> Option<LayerAddress> {
     let (mut current_t, end_t) = ray_grid_interval(ray_origin, ray, bounds)?;
     current_t = current_t.max(0.0) + 0.000_1;
@@ -2574,7 +2639,8 @@ fn pick_l2j_ray(
             .filter(|layer| layer_filter.map_or(true, |wanted| *layer == wanted))
             .filter_map(|layer| {
                 let cell = document.cell(LayerAddress::new(x, y, layer))?;
-                if cell.height == NULL_HEIGHT {
+                if cell.height == NULL_HEIGHT || hide_fully_open_blocks && layer_is_fully_open(cell)
+                {
                     return None;
                 }
                 let height_t = (cell.height as f32 - ray_origin[1]) / ray[1];
@@ -3939,6 +4005,81 @@ mod tests {
             (13, 22, 7.35, false)
         );
     }
+    #[test]
+    fn fully_open_filter_hides_only_blocks_without_restrictions() {
+        let mut document = Document::blank();
+        assert!(block_is_fully_open(&document, 0, 0));
+
+        document.force_set_nswe([LayerAddress::new(0, 0, 0)], 0, "bloquear");
+
+        assert!(!block_is_fully_open(&document, 0, 0));
+        assert!(block_is_fully_open(&document, 1, 0));
+    }
+
+    #[test]
+    fn hidden_fully_open_blocks_cannot_be_picked() {
+        let document = Document::blank();
+        let bounds = Box3::new(
+            Vec3::new(0.0, -100.0, 0.0),
+            Vec3::new(32_768.0, 100.0, 32_768.0),
+        );
+
+        assert_eq!(
+            pick_l2j_ray(
+                &document,
+                bounds,
+                [8.0, 50.0, 8.0],
+                [0.0, -1.0, 0.0],
+                None,
+                false,
+            ),
+            Some(LayerAddress::new(0, 0, 0))
+        );
+        assert_eq!(
+            pick_l2j_ray(
+                &document,
+                bounds,
+                [8.0, 50.0, 8.0],
+                [0.0, -1.0, 0.0],
+                None,
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hidden_filter_skips_open_cells_inside_mixed_blocks() {
+        let mut document = Document::blank();
+        document.force_set_nswe([LayerAddress::new(0, 0, 0)], 0, "bloquear");
+        let bounds = Box3::new(
+            Vec3::new(0.0, -100.0, 0.0),
+            Vec3::new(32_768.0, 100.0, 32_768.0),
+        );
+
+        assert_eq!(
+            pick_l2j_ray(
+                &document,
+                bounds,
+                [8.0, 50.0, 8.0],
+                [0.0, -1.0, 0.0],
+                None,
+                true,
+            ),
+            Some(LayerAddress::new(0, 0, 0))
+        );
+        assert_eq!(
+            pick_l2j_ray(
+                &document,
+                bounds,
+                [24.0, 50.0, 8.0],
+                [0.0, -1.0, 0.0],
+                None,
+                true,
+            ),
+            None
+        );
+    }
 
     #[test]
     fn nswe_icon_atlas_contains_all_sixteen_status_glyphs() {
@@ -3997,7 +4138,14 @@ mod tests {
         // At y=160 this ray reaches x=48, exactly inside geo cell (3, 0).
         // A height=0 first-pass estimate would instead jump to x=208.
         assert_eq!(
-            pick_l2j_ray(&document, bounds, [8.0, 200.0, 8.0], [1.0, -1.0, 0.0], None,),
+            pick_l2j_ray(
+                &document,
+                bounds,
+                [8.0, 200.0, 8.0],
+                [1.0, -1.0, 0.0],
+                None,
+                false,
+            ),
             Some(LayerAddress::new(3, 0, 0))
         );
     }
@@ -4027,7 +4175,14 @@ mod tests {
         );
 
         assert_eq!(
-            pick_l2j_ray(&document, bounds, [8.0, 200.0, 8.0], [0.0, -1.0, 0.0], None,),
+            pick_l2j_ray(
+                &document,
+                bounds,
+                [8.0, 200.0, 8.0],
+                [0.0, -1.0, 0.0],
+                None,
+                false,
+            ),
             Some(LayerAddress::new(0, 0, 1))
         );
         assert_eq!(
@@ -4037,6 +4192,7 @@ mod tests {
                 [8.0, 200.0, 8.0],
                 [0.0, -1.0, 0.0],
                 Some(0),
+                false,
             ),
             Some(LayerAddress::new(0, 0, 0))
         );
