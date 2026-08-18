@@ -27,6 +27,16 @@ uma cópia `.l2j.bak`.
 O histórico local do último cliente, mapa e arquivo fica em
 `%APPDATA%\GeodataEditor\editor-history.ini`.
 
+## Licença
+
+Este projeto é licenciado sob a **GNU General Public License, versão 3 ou
+posterior** (`GPL-3.0-or-later`). O texto integral está em
+[`LICENSE`](LICENSE).
+
+Ao distribuir `GeodataEditor.exe`, distribua também o código-fonte
+correspondente sob a mesma licença ou indique, junto do executável, onde ele
+pode ser obtido sem custo.
+
 ## Desenvolvimento
 
 ```powershell
