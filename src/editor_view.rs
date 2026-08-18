@@ -181,6 +181,7 @@ impl Preview {
             WindowBuilder::new()
                 .with_title(WINDOW_TITLE)
                 .with_inner_size(PhysicalSize::new(1440, 1000))
+                .with_visible(false)
                 .build(event_loop)
                 .map_err(|error| {
                     AppError::InvalidData(format!("can't create editor window: {error}"))
@@ -241,6 +242,8 @@ impl Preview {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        window.set_visible(true);
+        let _ = present_loading_screen(&window, &surface, &device, &queue, &config);
 
         let origin = map_origin(source_map.bounds);
         let camera = Camera::for_bounds(source_map.bounds);
@@ -402,6 +405,104 @@ impl Preview {
             draw_mesh(pass, pipeline, mesh, &self.camera_bind_group, lines);
         }
     }
+}
+
+fn present_loading_screen(
+    window: &Window,
+    surface: &wgpu::Surface<'_>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    config: &wgpu::SurfaceConfiguration,
+) -> std::result::Result<(), wgpu::SurfaceError> {
+    let output = surface.get_current_texture()?;
+    let view = output
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let pixels_per_point = window.scale_factor() as f32;
+    let screen_size = egui::vec2(
+        config.width as f32 / pixels_per_point,
+        config.height as f32 / pixels_per_point,
+    );
+    let context = egui::Context::default();
+    let mut raw_input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size)),
+        ..Default::default()
+    };
+    if let Some(viewport) = raw_input.viewports.get_mut(&egui::ViewportId::ROOT) {
+        viewport.native_pixels_per_point = Some(pixels_per_point);
+        viewport.inner_rect = raw_input.screen_rect;
+    }
+    let full_output = context.run(raw_input, |context| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(14, 19, 24)))
+            .show(context, |ui| {
+                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                    ui.add_space(((ui.available_height() - 110.0) * 0.5).max(0.0));
+                    ui.label(
+                        egui::RichText::new("GEODATA EDITOR")
+                            .size(28.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(42, 202, 219)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Carregando editor...")
+                            .size(15.0)
+                            .color(egui::Color32::from_rgb(190, 200, 210)),
+                    );
+                    ui.add_space(18.0);
+                    let (bar, _) =
+                        ui.allocate_exact_size(egui::vec2(240.0, 3.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(bar, 0.0, egui::Color32::from_rgb(42, 202, 219));
+                });
+            });
+    });
+    let paint_jobs = context.tessellate(full_output.shapes, full_output.pixels_per_point);
+    let screen = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [config.width, config.height],
+        pixels_per_point,
+    };
+    let mut renderer = egui_wgpu::Renderer::new(device, config.format, None, 1);
+    for (id, delta) in &full_output.textures_delta.set {
+        renderer.update_texture(device, queue, *id, delta);
+    }
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("editor-loading-frame"),
+    });
+    let user_commands = renderer.update_buffers(device, queue, &mut encoder, &paint_jobs, &screen);
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("editor-loading-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0044,
+                        g: 0.0065,
+                        b: 0.0091,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        renderer.render(&mut pass, &paint_jobs, &screen);
+    }
+    queue.submit(
+        user_commands
+            .into_iter()
+            .chain(std::iter::once(encoder.finish())),
+    );
+    output.present();
+    for id in &full_output.textures_delta.free {
+        renderer.free_texture(id);
+    }
+    Ok(())
 }
 
 struct EditorView {
