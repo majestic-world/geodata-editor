@@ -126,6 +126,31 @@ impl PackageLoader {
         *self.loaded_package_count.borrow()
     }
 
+    /// Whether a package file exists, without decrypting or parsing it.
+    /// Used to offer the other map flavour when the selected one is absent.
+    pub fn has_package(&self, name: &str) -> bool {
+        self.package_path(name).is_some()
+    }
+
+    /// The four directories a package can live in, in the order the client
+    /// itself resolves them.
+    fn package_path(&self, name: &str) -> Option<PathBuf> {
+        const CANDIDATES: [(&str, &str); 4] = [
+            ("Maps", "unr"),
+            ("StaticMeshes", "usx"),
+            ("Textures", "utx"),
+            ("SysTextures", "utx"),
+        ];
+        CANDIDATES
+            .iter()
+            .map(|(directory, extension)| {
+                self.root
+                    .join(directory)
+                    .join(format!("{name}.{extension}"))
+            })
+            .find(|path| path.is_file())
+    }
+
     fn warn(&self, component: &str, message: impl AsRef<str>) {
         if self.verbose && self.log_level >= 3 {
             eprintln!("[{component}] {}", message.as_ref());
@@ -136,20 +161,8 @@ impl PackageLoader {
         if let Some(archive) = self.archives.borrow().get(name) {
             return Ok(Rc::clone(archive));
         }
-        let candidates = [
-            ("Maps", "unr"),
-            ("StaticMeshes", "usx"),
-            ("Textures", "utx"),
-            ("SysTextures", "utx"),
-        ];
-        let path = candidates
-            .iter()
-            .map(|(directory, extension)| {
-                self.root
-                    .join(directory)
-                    .join(format!("{name}.{extension}"))
-            })
-            .find(|path| path.is_file())
+        let path = self
+            .package_path(name)
             .ok_or_else(|| AppError::Missing(format!("can't find package: {name}")))?;
         self.info("Unreal", format!("Loading package: {name}"));
         let data = decrypt(&path)?;
@@ -232,8 +245,8 @@ impl PackageLoader {
                     self.warn("App", format!("No static mesh for actor: {name}"));
                     continue;
                 };
-                let mesh = match self.static_mesh_ref(&archive, mesh_index) {
-                    Ok(mesh) => mesh,
+                let (_, mesh) = match self.static_mesh_ref(&archive, mesh_index) {
+                    Ok(resolved) => resolved,
                     Err(AppError::Missing(_)) => {
                         self.warn("App", format!("No static mesh for actor: {name}"));
                         continue;
@@ -274,6 +287,104 @@ impl PackageLoader {
         Ok(map)
     }
 
+    /// Builds a textured representation of the map for the textured
+    /// visualization mode (Fase 3-5 v1): every static mesh surface
+    /// (regardless of collision flags) and every visible BSP surface,
+    /// grouped by material texture, plus the terrain's base layer texture
+    /// (no alpha blending between layers yet). Heavier than `load_map`
+    /// (decodes every referenced texture), so callers should only invoke it
+    /// when the textured view is actually enabled.
+    pub fn load_visual_scene(&self, name: &str) -> Result<VisualScene> {
+        let archive = self.archive(name)?;
+        let mut builder = VisualSceneBuilder::default();
+
+        if let Some(terrain) = archive
+            .objects_named("TerrainInfo", self)?
+            .into_iter()
+            .find_map(|object| match object.as_ref() {
+                Object::Terrain(value) => Some(value.clone()),
+                _ => None,
+            })
+        {
+            if let Some(base_layer) = terrain.layers.first().copied() {
+                let heightmap = self.texture_ref(&archive, terrain.map_index, "TerrainMap")?;
+                if !heightmap.mips.is_empty() && !terrain.broken_scale() {
+                    let position = terrain.position(&heightmap);
+                    let scale = terrain.scale();
+                    let mesh =
+                        terrain_visual_mesh(&terrain, &heightmap, base_layer, position, scale)?;
+                    let texture = self.visual_texture_ref(&archive, base_layer.texture_index)?;
+                    builder.add(texture, &mesh, Transform::default());
+                }
+            }
+        }
+
+        for class_name in [
+            "StaticMeshActor",
+            "MovableStaticMeshActor",
+            "L2MovableStaticMeshActor",
+        ] {
+            for object in archive.objects_named(class_name, self)? {
+                let Object::Actor(actor) = object.as_ref() else {
+                    continue;
+                };
+                if actor.delete_me || actor.hidden {
+                    continue;
+                }
+                let Some(mesh_index) = actor.static_mesh else {
+                    continue;
+                };
+                let (mesh_archive, mesh) = match self.static_mesh_ref(&archive, mesh_index) {
+                    Ok(resolved) => resolved,
+                    Err(AppError::Missing(_)) => continue,
+                    Err(error) => return Err(error),
+                };
+                let transform = actor.transform();
+                for (material_index, surface_mesh) in mesh.visual_surfaces()? {
+                    if exceeds_region_tile(&surface_mesh, transform) {
+                        continue;
+                    }
+                    // Material indices belong to the package the mesh was
+                    // serialized in, which is rarely the map itself.
+                    let texture = match material_index {
+                        Some(index) => self.visual_texture_ref(&mesh_archive, index)?,
+                        None => None,
+                    };
+                    builder.add(texture, &surface_mesh, transform);
+                }
+            }
+        }
+
+        for object in archive.objects_named("Level", self)? {
+            let Object::Level(level) = object.as_ref() else {
+                continue;
+            };
+            let model = self.model_ref(&archive, level.model_index, "Level.Model")?;
+            for (material_index, mut mesh) in model.visual_surfaces()? {
+                if exceeds_region_tile(&mesh, Transform::default()) {
+                    continue;
+                }
+                let texture = match material_index {
+                    Some(index) => self.visual_texture_ref(&archive, index)?,
+                    None => None,
+                };
+                // `Model::visual_surfaces` returns texel-space UV (Unreal's
+                // native BSP mapping); normalize it to 0..1 now that the
+                // resolved texture's real dimensions are known.
+                if let Some(texture) = &texture {
+                    let width = texture.width.max(1) as f32;
+                    let height = texture.height.max(1) as f32;
+                    for vertex in &mut mesh.vertices {
+                        vertex.uv[0] /= width;
+                        vertex.uv[1] /= height;
+                    }
+                }
+                builder.add(texture, &mesh, Transform::default());
+            }
+        }
+        Ok(builder.finish())
+    }
+
     fn side_terrain(&self, x: i32, y: i32) -> Result<Option<(Terrain, Texture)>> {
         let Some(archive) = self.try_archive(&format!("{x}_{y}"))? else {
             return Ok(None);
@@ -295,7 +406,7 @@ impl PackageLoader {
         Ok(Some((terrain, texture)))
     }
 
-    fn object_ref(&self, archive: &Rc<Archive>, index: i32, context: &str) -> Result<Rc<Object>> {
+    fn object_ref(&self, archive: &Rc<Archive>, index: i32, context: &str) -> Result<OwnedObject> {
         if index == 0 {
             return Err(AppError::Missing(format!(
                 "required object reference is empty: {context}"
@@ -305,7 +416,7 @@ impl PackageLoader {
     }
 
     fn texture_ref(&self, archive: &Rc<Archive>, index: i32, context: &str) -> Result<Texture> {
-        match self.object_ref(archive, index, context)?.as_ref() {
+        match self.object_ref(archive, index, context)?.object.as_ref() {
             Object::Texture(texture) => Ok(texture.clone()),
             other => Err(AppError::InvalidData(format!(
                 "{context} is {}, not Texture",
@@ -313,12 +424,63 @@ impl PackageLoader {
             ))),
         }
     }
-    fn static_mesh_ref(&self, archive: &Rc<Archive>, index: i32) -> Result<StaticMesh> {
-        match self
-            .object_ref(archive, index, "Actor.StaticMesh")?
-            .as_ref()
-        {
-            Object::StaticMesh(mesh) => Ok(mesh.clone()),
+
+    /// Resolves a `Materials[i].Material` or BSP surface material index to
+    /// its decoded texture, following Unreal's material graph until a plain
+    /// bitmap turns up. `None` covers every expected "no texture here" case:
+    /// a zero/absent reference, an import that can't be found, a texture in
+    /// a format the decoder doesn't cover, and graphs that bottom out in a
+    /// node carrying no bitmap at all, so those surfaces render untextured
+    /// instead of failing the whole map.
+    fn visual_texture_ref(
+        &self,
+        archive: &Rc<Archive>,
+        index: i32,
+    ) -> Result<Option<VisualTexture>> {
+        // Depth guard: material graphs are shallow by construction, and a
+        // malformed package must not spin here.
+        const MAX_MATERIAL_DEPTH: usize = 8;
+
+        let mut owner = Rc::clone(archive);
+        let mut index = index;
+        for _ in 0..MAX_MATERIAL_DEPTH {
+            if index == 0 {
+                return Ok(None);
+            }
+            let resolved = match owner.object_at(index, self) {
+                Ok(resolved) => resolved,
+                Err(AppError::Missing(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            match resolved.object.as_ref() {
+                Object::Texture(texture) => {
+                    return Ok(texture.rgba.clone().map(|rgba| VisualTexture {
+                        width: texture.u_size.max(0) as u32,
+                        height: texture.v_size.max(0) as u32,
+                        rgba,
+                    }));
+                }
+                // A modifier's forward edge can point into another package,
+                // so the owning archive has to travel with the index.
+                Object::Material(wrapper) => {
+                    index = wrapper.inner;
+                    owner = resolved.archive;
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+    /// The static mesh plus the archive it lives in. Callers need the owner
+    /// to resolve the mesh's own material references.
+    fn static_mesh_ref(
+        &self,
+        archive: &Rc<Archive>,
+        index: i32,
+    ) -> Result<(Rc<Archive>, StaticMesh)> {
+        let resolved = self.object_ref(archive, index, "Actor.StaticMesh")?;
+        match resolved.object.as_ref() {
+            Object::StaticMesh(mesh) => Ok((resolved.archive, mesh.clone())),
             other => Err(AppError::InvalidData(format!(
                 "Actor.StaticMesh is {}, not StaticMesh",
                 other.kind()
@@ -326,7 +488,7 @@ impl PackageLoader {
         }
     }
     fn model_ref(&self, archive: &Rc<Archive>, index: i32, context: &str) -> Result<Model> {
-        match self.object_ref(archive, index, context)?.as_ref() {
+        match self.object_ref(archive, index, context)?.object.as_ref() {
             Object::Model(model) => Ok(model.clone()),
             other => Err(AppError::InvalidData(format!(
                 "{context} is {}, not Model",
@@ -413,6 +575,15 @@ struct Export {
     flags: u32,
     serial_size: i32,
     serial_offset: i32,
+}
+
+/// An object paired with the archive that owns it. Object indices inside a
+/// parsed object (a static mesh's material slots, for instance) are relative
+/// to the owning package's import/export tables, never to the package that
+/// imported it.
+struct OwnedObject {
+    archive: Rc<Archive>,
+    object: Rc<Object>,
 }
 
 struct Archive {
@@ -517,9 +688,18 @@ impl Archive {
             .collect()
     }
 
-    fn object_at(&self, index: i32, loader: &PackageLoader) -> Result<Rc<Object>> {
+    /// Resolves an object reference, returning the object together with the
+    /// archive its own object indices are relative to.
+    ///
+    /// The owner matters: a `StaticMesh` imported from another package holds
+    /// `Materials[i].Material` indices in *that* package's index space, so
+    /// resolving them against the importing map yields unrelated objects.
+    fn object_at(self: &Rc<Self>, index: i32, loader: &PackageLoader) -> Result<OwnedObject> {
         if index > 0 {
-            return self.load_export((index - 1) as usize, loader);
+            return Ok(OwnedObject {
+                archive: Rc::clone(self),
+                object: self.load_export((index - 1) as usize, loader)?,
+            });
         }
         let import_index = (-index - 1) as usize;
         let import = self.imports.get(import_index).ok_or_else(|| {
@@ -547,6 +727,10 @@ impl Archive {
             })
             .map(|(index, _)| archive.load_export(index, loader))
             .transpose()?
+            .map(|object| OwnedObject {
+                archive: Rc::clone(&archive),
+                object,
+            })
             .ok_or_else(|| {
                 AppError::Missing(format!(
                     "can't find object {}.{}",
@@ -607,6 +791,13 @@ impl Archive {
             "Brush" | "BlockingVolume" => {
                 Ok(Object::Brush(Brush::read(self, reader, export.flags)?))
             }
+            "Shader" | "Combiner" | "FinalBlend" | "ColorModifier" | "TexEnvMap" | "TexPanner"
+            | "TexRotator" | "TexScaler" | "TexOscillator" | "OpacityModifier"
+            | "TexCoordSource" | "Modifier" => Ok(Object::Material(MaterialWrapper::read(
+                self,
+                reader,
+                export.flags,
+            )?)),
             _ => Ok(Object::Unknown),
         }
     }
@@ -671,6 +862,7 @@ enum Object {
     Level(Level),
     Model(Model),
     Brush(Brush),
+    Material(MaterialWrapper),
 }
 impl Object {
     fn kind(&self) -> &'static str {
@@ -683,7 +875,32 @@ impl Object {
             Self::Level(_) => "Level",
             Self::Model(_) => "Model",
             Self::Brush(_) => "Brush",
+            Self::Material(_) => "material modifier",
         }
+    }
+}
+
+/// A node in Unreal's material graph that wraps another material: `Shader`,
+/// `Combiner`, `FinalBlend`, `ColorModifier` and the `Tex*` modifiers. The
+/// textured visualization only needs the bitmap at the bottom of the chain,
+/// so each node is reduced to the reference it forwards to.
+#[derive(Clone, Copy)]
+struct MaterialWrapper {
+    inner: i32,
+}
+
+impl MaterialWrapper {
+    fn read(archive: &Archive, reader: &mut Reader<'_>, flags: u32) -> Result<Self> {
+        let props = read_properties(archive, reader, flags)?;
+        // Order matters. On a `Shader`, `Diffuse` is the visible bitmap while
+        // `Material` (when present at all) is a secondary input; on the
+        // modifiers and `FinalBlend`, `Material` is the only forward edge.
+        // `Combiner` mixes two inputs and `Material1` is the base layer.
+        let inner = ["Diffuse", "Material", "Material1", "Material2"]
+            .into_iter()
+            .find_map(|name| props.index(name))
+            .unwrap_or(0);
+        Ok(Self { inner })
     }
 }
 
@@ -696,6 +913,143 @@ struct Vertex {
 struct Mesh {
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
+}
+
+/// Decoded RGBA8 pixels for one material's texture, ready for GPU upload.
+/// `rgba` is shared (via `Rc`) with the `Texture` object it came from, so
+/// cloning a `VisualTexture` never copies pixel data.
+#[derive(Clone)]
+pub struct VisualTexture {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Rc<[u8]>,
+}
+
+#[derive(Clone, Copy)]
+struct VisualVertex {
+    position: Vec3,
+    normal: Vec3,
+    uv: [f32; 2],
+}
+#[derive(Clone, Default)]
+struct VisualMesh {
+    vertices: Vec<VisualVertex>,
+    indices: Vec<u32>,
+}
+impl VisualMesh {
+    /// Merges `other` (in its own local, untransformed space) into `self`
+    /// in world space, matching `SourceMap::add_mesh`'s axis convention
+    /// (Recast's X/Y/Z is Lineage's X/Z/Y).
+    fn append(&mut self, other: &VisualMesh, transform: Transform) {
+        let offset = self.vertices.len() as u32;
+        self.vertices
+            .extend(other.vertices.iter().map(|vertex| VisualVertex {
+                position: transform.point(vertex.position).swap_yz(),
+                normal: transform.normal(vertex.normal).swap_yz(),
+                uv: vertex.uv,
+            }));
+        self.indices
+            .extend(other.indices.iter().map(|index| index + offset));
+    }
+}
+
+/// One Lineage II region tile is 2048 geodata cells of 16 units: 32768
+/// units on each horizontal axis. A surface is dropped once it spans more
+/// than two of them.
+///
+/// This is not a heuristic about "large" props. A map's zone carries
+/// backdrop sheets that belong to the client's fog/water zone system, not
+/// to the tile's detail: `17_22_Classic` ships a single unlit, wavy-flagged
+/// quad spanning 655360 units (20 tiles) at z=-16384, far below the
+/// terrain floor. The client bounds it by zone and draws it translucent;
+/// drawn here as ordinary opaque geometry it blankets the entire horizon.
+/// Real map geometry, terrain included, always fits inside its own tile.
+fn exceeds_region_tile(mesh: &VisualMesh, transform: Transform) -> bool {
+    const REGION_TILE_SPAN: f32 = 32_768.0;
+    const MAX_SURFACE_SPAN: f32 = REGION_TILE_SPAN * 2.0;
+
+    let mut min = Vec3::new(f32::MAX, f32::MAX, f32::MAX);
+    let mut max = Vec3::new(f32::MIN, f32::MIN, f32::MIN);
+    for vertex in &mesh.vertices {
+        let point = transform.point(vertex.position);
+        min.x = min.x.min(point.x);
+        min.y = min.y.min(point.y);
+        max.x = max.x.max(point.x);
+        max.y = max.y.max(point.y);
+    }
+    if mesh.vertices.is_empty() {
+        return false;
+    }
+    // Unreal's X/Y are the horizontal axes here; the swap to the preview's
+    // basis happens later, in `VisualMesh::append`.
+    (max.x - min.x).max(max.y - min.y) > MAX_SURFACE_SPAN
+}
+
+/// One draw batch of the textured visualization: every triangle sharing the
+/// same material texture (or the same absence of one), merged across every
+/// terrain tile, static mesh instance, and BSP surface that references it.
+pub struct VisualBatch {
+    pub texture: Option<VisualTexture>,
+    pub vertices: Vec<(Vec3, Vec3, [f32; 2])>,
+    pub indices: Vec<u32>,
+}
+
+/// A fully resolved, textured representation of a map, built on demand by
+/// [`PackageLoader::load_visual_scene`] for the textured visualization mode.
+/// Unlike [`SourceMap`], geometry is grouped by material instead of by
+/// geometry source, and every surface (not only collidable ones) is
+/// included.
+#[derive(Default)]
+pub struct VisualScene {
+    pub batches: Vec<VisualBatch>,
+}
+
+#[derive(Default)]
+struct VisualSceneBuilder {
+    // Keyed by the decoded texture's pixel buffer identity (`Rc::as_ptr`),
+    // so every material that shares the same underlying `Texture` export
+    // merges into one draw batch instead of one per surface. `None` groups
+    // every untextured surface (unsupported or unresolved material) into a
+    // single fallback batch.
+    slots: HashMap<Option<usize>, usize>,
+    batches: Vec<(Option<VisualTexture>, VisualMesh)>,
+}
+impl VisualSceneBuilder {
+    fn add(&mut self, texture: Option<VisualTexture>, mesh: &VisualMesh, transform: Transform) {
+        if mesh.indices.is_empty() {
+            return;
+        }
+        let key = texture
+            .as_ref()
+            .map(|texture| Rc::as_ptr(&texture.rgba) as *const u8 as usize);
+        let index = match self.slots.get(&key) {
+            Some(&index) => index,
+            None => {
+                let index = self.batches.len();
+                self.batches.push((texture, VisualMesh::default()));
+                self.slots.insert(key, index);
+                index
+            }
+        };
+        self.batches[index].1.append(mesh, transform);
+    }
+    fn finish(self) -> VisualScene {
+        VisualScene {
+            batches: self
+                .batches
+                .into_iter()
+                .map(|(texture, mesh)| VisualBatch {
+                    texture,
+                    vertices: mesh
+                        .vertices
+                        .into_iter()
+                        .map(|vertex| (vertex.position, vertex.normal, vertex.uv))
+                        .collect(),
+                    indices: mesh.indices,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -786,6 +1140,19 @@ struct Terrain {
     edge_turn: Vec<u8>,
     map_x: i32,
     map_y: i32,
+    /// Every terrain layer, base layer first. Used only by the textured
+    /// visualization (Fase 5 v1: base layer only, no alpha blending between
+    /// layers yet).
+    layers: Vec<TerrainLayer>,
+}
+/// One entry of `TerrainInfo.Layers`. `UScale`/`VScale` express how many
+/// world units one texture repeat spans; texture rotation and per-layer
+/// alpha masks are not modelled yet (Fase 5 v2).
+#[derive(Clone, Copy)]
+struct TerrainLayer {
+    texture_index: i32,
+    u_scale: f32,
+    v_scale: f32,
 }
 impl Terrain {
     fn read(archive: &Archive, reader: &mut Reader<'_>, flags: u32) -> Result<Self> {
@@ -793,6 +1160,24 @@ impl Terrain {
         let map_index = props
             .index("TerrainMap")
             .ok_or_else(|| AppError::InvalidData("TerrainInfo without TerrainMap".into()))?;
+        let layers = props
+            .all_struct_maps("Layers")
+            .iter()
+            .filter_map(|layer| {
+                let texture_index = layer.index("Texture")?;
+                Some(TerrainLayer {
+                    texture_index,
+                    u_scale: layer
+                        .float("UScale")
+                        .filter(|value| *value != 0.0)
+                        .unwrap_or(1.0),
+                    v_scale: layer
+                        .float("VScale")
+                        .filter(|value| *value != 0.0)
+                        .unwrap_or(1.0),
+                })
+            })
+            .collect();
         Ok(Self {
             actor: Actor::from_properties(&props),
             map_index,
@@ -801,6 +1186,7 @@ impl Terrain {
             edge_turn: props.bytes("EdgeTurnBitmap").unwrap_or_default(),
             map_x: props.integer("MapX").unwrap_or(0),
             map_y: props.integer("MapY").unwrap_or(0),
+            layers,
         })
     }
     fn broken_scale(&self) -> bool {
@@ -854,6 +1240,12 @@ struct Texture {
     u_size: i32,
     v_size: i32,
     mips: Vec<Vec<u8>>,
+    /// Top mip decoded to tightly packed RGBA8, for formats this reader can
+    /// display (DXT1/DXT3/DXT5/RGBA8). `None` for the terrain heightmap
+    /// format (G16, consumed instead by `heights()`) and for formats not
+    /// decoded yet (P8, RGB8, RGB16, RGBA7); those textures fall back to an
+    /// untextured material instead of failing the whole map load.
+    rgba: Option<Rc<[u8]>>,
 }
 impl Texture {
     fn read(archive: &Archive, reader: &mut Reader<'_>, flags: u32) -> Result<Self> {
@@ -866,44 +1258,35 @@ impl Texture {
             archive.header.file_version,
             archive.header.license_version,
         )?;
-        let mips = if matches!(format, 3 | 5 | 7 | 8 | 10) {
-            let block_size = match format {
-                3 => 8,
-                7 | 8 => 16,
-                10 => 32,
-                5 => 64,
-                _ => unreachable!(),
-            };
-            let expected = (u_size / 4)
-                .checked_mul(v_size / 4)
-                .and_then(|size| size.checked_mul(block_size))
-                .ok_or_else(|| AppError::InvalidData("invalid texture size".into()))?;
-            let mut size = -1;
-            while size != expected {
-                size = reader.index()?;
-                if reader.remaining() == 0 {
-                    return Err(AppError::InvalidData(
-                        "unexpected EOF while deserializing texture".into(),
-                    ));
-                }
+        // `Texture.Mips` has a fixed layout the generic property reader
+        // never sees: one leading byte for the mip count (not a compact
+        // index, unlike every other Unreal array), then per mip a
+        // `TLazyArray<BYTE>` (4-byte skip offset, compact-index byte count,
+        // raw bytes) followed by that mip's own USize/VSize/UBits/VBits.
+        // Only mip 0 (the top, full-resolution mip) is needed here.
+        let mip_count = reader.u8()?;
+        let mut mips = Vec::new();
+        let mut rgba = None;
+        if mip_count != 0 {
+            reader.skip(4)?;
+            let size = usize::try_from(reader.index()?)
+                .map_err(|_| AppError::InvalidData("negative texture mip size".into()))?;
+            let pixels = reader.bytes(size)?;
+            let mip_width = reader.i32()?;
+            let mip_height = reader.i32()?;
+            reader.skip(2)?; // UBits, VBits
+            if format == 10 {
+                mips.push(pixels);
+            } else {
+                rgba = decode_texture_rgba(format, mip_width, mip_height, &pixels);
             }
-            vec![
-                reader.bytes(
-                    usize::try_from(size)
-                        .map_err(|_| AppError::InvalidData("negative mip size".into()))?,
-                )?,
-            ]
-        } else {
-            // Non-heightmap texture payloads are irrelevant to build mode, but
-            // their serialized array still has to be consumed precisely.
-            let _discarded = read_array(reader, |reader| reader.u8())?;
-            Vec::new()
-        };
+        }
         Ok(Self {
             format,
             u_size,
             v_size,
             mips,
+            rgba,
         })
     }
     fn heights(&self) -> Result<Vec<u16>> {
@@ -936,12 +1319,179 @@ impl Texture {
     }
 }
 
+/// Decodes a texture's top mip to tightly packed RGBA8, for the formats used
+/// by Lineage II's world/prop textures. Returns `None` for formats this
+/// reader does not decode yet, so callers can fall back to an untextured
+/// material instead of failing.
+fn decode_texture_rgba(format: u8, width: i32, height: i32, bytes: &[u8]) -> Option<Rc<[u8]>> {
+    let width = usize::try_from(width).ok().filter(|value| *value > 0)?;
+    let height = usize::try_from(height).ok().filter(|value| *value > 0)?;
+    let pixels = match format {
+        3 => decode_dxt(bytes, width, height, 1).ok()?,
+        7 => decode_dxt(bytes, width, height, 3).ok()?,
+        8 => decode_dxt(bytes, width, height, 5).ok()?,
+        5 => bgra_to_rgba(bytes, width, height).ok()?,
+        _ => return None,
+    };
+    Some(Rc::from(pixels))
+}
+
+fn bgra_to_rgba(pixels: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
+    let needed = width
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| AppError::InvalidData("texture too large".into()))?;
+    let pixels = pixels
+        .get(..needed)
+        .ok_or_else(|| AppError::InvalidData("truncated RGBA8 texture data".into()))?;
+    let mut rgba = Vec::with_capacity(needed);
+    for pixel in pixels.chunks_exact(4) {
+        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    Ok(rgba)
+}
+
+/// Decodes a DXT1 (`kind == 1`), DXT3 (`kind == 3`) or DXT5 (`kind == 5`)
+/// block-compressed mip to tightly packed RGBA8.
+fn decode_dxt(source: &[u8], width: usize, height: usize, kind: u8) -> Result<Vec<u8>> {
+    let block_bytes = if kind == 1 { 8 } else { 16 };
+    let block_width = width.div_ceil(4);
+    let block_height = height.div_ceil(4);
+    let required = block_width
+        .checked_mul(block_height)
+        .and_then(|blocks| blocks.checked_mul(block_bytes))
+        .ok_or_else(|| AppError::InvalidData("texture too large".into()))?;
+    if source.len() < required {
+        return Err(AppError::InvalidData("truncated DXT texture data".into()));
+    }
+    let mut output = vec![
+        0u8;
+        width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| AppError::InvalidData("texture too large".into()))?
+    ];
+    let mut offset = 0;
+    for block_y in 0..block_height {
+        for block_x in 0..block_width {
+            let block = &source[offset..offset + block_bytes];
+            offset += block_bytes;
+            let (alpha, color_offset) = match kind {
+                1 => ([255u8; 16], 0),
+                3 => {
+                    let mut alpha = [0u8; 16];
+                    for index in 0..16 {
+                        alpha[index] = if index % 2 == 0 {
+                            (block[index / 2] & 0x0f) * 17
+                        } else {
+                            (block[index / 2] >> 4) * 17
+                        };
+                    }
+                    (alpha, 8)
+                }
+                _ => {
+                    let mut palette = [0u8; 8];
+                    palette[0] = block[0];
+                    palette[1] = block[1];
+                    if palette[0] > palette[1] {
+                        for index in 2..8 {
+                            palette[index] = (((8 - index) as u16 * palette[0] as u16
+                                + (index - 1) as u16 * palette[1] as u16)
+                                / 7) as u8;
+                        }
+                    } else {
+                        for index in 2..6 {
+                            palette[index] = (((6 - index) as u16 * palette[0] as u16
+                                + (index - 1) as u16 * palette[1] as u16)
+                                / 5) as u8;
+                        }
+                        palette[6] = 0;
+                        palette[7] = 255;
+                    }
+                    let bits = block[2..8]
+                        .iter()
+                        .enumerate()
+                        .fold(0u64, |bits, (index, byte)| {
+                            bits | ((*byte as u64) << (index * 8))
+                        });
+                    let mut alpha = [0u8; 16];
+                    for index in 0..16 {
+                        alpha[index] = palette[((bits >> (index * 3)) & 7) as usize];
+                    }
+                    (alpha, 8)
+                }
+            };
+            let c0 = u16::from_le_bytes([block[color_offset], block[color_offset + 1]]);
+            let c1 = u16::from_le_bytes([block[color_offset + 2], block[color_offset + 3]]);
+            let palette = dxt_palette(c0, c1);
+            let bits = u32::from_le_bytes([
+                block[color_offset + 4],
+                block[color_offset + 5],
+                block[color_offset + 6],
+                block[color_offset + 7],
+            ]);
+            for pixel_y in 0..4 {
+                for pixel_x in 0..4 {
+                    let x = block_x * 4 + pixel_x;
+                    let y = block_y * 4 + pixel_y;
+                    if x >= width || y >= height {
+                        continue;
+                    }
+                    let index = pixel_y * 4 + pixel_x;
+                    let color_index = ((bits >> (index * 2)) & 3) as usize;
+                    let target = (y * width + x) * 4;
+                    let transparent = kind == 1 && c0 <= c1 && color_index == 3;
+                    if transparent {
+                        output[target..target + 4].fill(0);
+                    } else {
+                        output[target..target + 3].copy_from_slice(&palette[color_index]);
+                        output[target + 3] = alpha[index];
+                    }
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn dxt_palette(c0: u16, c1: u16) -> [[u8; 3]; 4] {
+    let unpack = |color: u16| {
+        [
+            ((color >> 11 & 31) * 255 / 31) as u8,
+            ((color >> 5 & 63) * 255 / 63) as u8,
+            ((color & 31) * 255 / 31) as u8,
+        ]
+    };
+    let first = unpack(c0);
+    let second = unpack(c1);
+    let mut colors = [first, second, [0; 3], [0; 3]];
+    for channel in 0..3 {
+        if c0 > c1 {
+            colors[2][channel] = ((2 * first[channel] as u16 + second[channel] as u16) / 3) as u8;
+            colors[3][channel] = ((first[channel] as u16 + 2 * second[channel] as u16) / 3) as u8;
+        } else {
+            colors[2][channel] = ((first[channel] as u16 + second[channel] as u16) / 2) as u8;
+        }
+    }
+    colors
+}
+
 #[derive(Clone)]
 struct StaticMesh {
     vertices: Vec<Vertex>,
+    /// First UV stream, parallel to `vertices`. Empty when the mesh has no
+    /// UV stream at all (falls back to `[0.0, 0.0]` everywhere it's read).
+    uvs: Vec<[f32; 2]>,
     surfaces: Vec<StaticSurface>,
     indices: Vec<u16>,
-    materials: Vec<bool>,
+    materials: Vec<MaterialSlot>,
+}
+#[derive(Clone, Copy, Default)]
+struct MaterialSlot {
+    enable_collision: bool,
+    /// Object index of `Materials[i].Material`, resolved later against the
+    /// owning archive. `None` when the slot has no material assigned.
+    material_index: Option<i32>,
 }
 #[derive(Clone)]
 struct StaticSurface {
@@ -986,14 +1536,14 @@ impl StaticMesh {
         reader.u32()?;
         let uv_stream_count = reader.index()?;
         check_count("UV stream", uv_stream_count)?;
-        for _ in 0..uv_stream_count {
-            let _uvs = read_array(reader, |reader| {
-                reader.f32()?;
-                reader.f32()?;
-                Ok(())
-            })?;
+        let mut uvs = Vec::new();
+        for stream in 0..uv_stream_count {
+            let stream_uvs = read_array(reader, |reader| Ok([reader.f32()?, reader.f32()?]))?;
             reader.u32()?;
             reader.u32()?;
+            if stream == 0 {
+                uvs = stream_uvs;
+            }
         }
         let indices = read_array(reader, |reader| reader.u16())?;
         reader.u32()?;
@@ -1003,10 +1553,14 @@ impl StaticMesh {
         let materials = props
             .array_maps("Materials")
             .iter()
-            .map(|map| map.boolean("EnableCollision"))
+            .map(|map| MaterialSlot {
+                enable_collision: map.boolean("EnableCollision"),
+                material_index: map.index("Material"),
+            })
             .collect();
         Ok(Self {
             vertices,
+            uvs,
             surfaces,
             indices,
             materials,
@@ -1018,7 +1572,11 @@ impl StaticMesh {
             indices: Vec::new(),
         };
         for (surface_index, surface) in self.surfaces.iter().enumerate() {
-            if !self.materials.get(surface_index).copied().unwrap_or(false) {
+            if !self
+                .materials
+                .get(surface_index)
+                .is_some_and(|slot| slot.enable_collision)
+            {
                 continue;
             }
             for triangle in 0..surface.triangle_max as usize {
@@ -1031,6 +1589,43 @@ impl StaticMesh {
             }
         }
         Ok(mesh)
+    }
+    /// Every surface's local-space (untransformed) textured mesh, paired
+    /// with the object index of the material it should be resolved
+    /// against. Unlike `collision_mesh`, every surface is included
+    /// regardless of `EnableCollision`, since the textured visualization
+    /// cares about visual completeness, not passability.
+    fn visual_surfaces(&self) -> Result<Vec<(Option<i32>, VisualMesh)>> {
+        let mut result = Vec::with_capacity(self.surfaces.len());
+        for (surface_index, surface) in self.surfaces.iter().enumerate() {
+            let mut mesh = VisualMesh::default();
+            for triangle in 0..surface.triangle_max as usize {
+                let start = surface.first_index as usize + triangle * 3;
+                let values = self.indices.get(start..start + 3).ok_or_else(|| {
+                    AppError::InvalidData("StaticMesh surface index range is invalid".into())
+                })?;
+                for &value in [values[2], values[1], values[0]].iter() {
+                    let index = value as usize;
+                    let Some(vertex) = self.vertices.get(index) else {
+                        continue;
+                    };
+                    let uv = self.uvs.get(index).copied().unwrap_or([0.0, 0.0]);
+                    let vertex_index = mesh.vertices.len() as u32;
+                    mesh.vertices.push(VisualVertex {
+                        position: vertex.position,
+                        normal: vertex.normal,
+                        uv,
+                    });
+                    mesh.indices.push(vertex_index);
+                }
+            }
+            let material_index = self
+                .materials
+                .get(surface_index)
+                .and_then(|slot| slot.material_index);
+            result.push((material_index, mesh));
+        }
+        Ok(result)
     }
 }
 
@@ -1101,6 +1696,7 @@ struct BspNode {
 }
 #[derive(Clone)]
 struct BspSurface {
+    material_index: i32,
     polygon_flags: u32,
     base_index: i32,
     normal_index: i32,
@@ -1145,7 +1741,7 @@ impl Model {
         })?;
         let license = archive.header.license_version;
         let surfaces = read_array(reader, |reader| {
-            reader.index()?;
+            let material_index = reader.index()?;
             let polygon_flags = reader.u32()?;
             let base_index = reader.index()?;
             let normal_index = reader.index()?;
@@ -1159,6 +1755,7 @@ impl Model {
                 reader.u32()?;
             }
             Ok(BspSurface {
+                material_index,
                 polygon_flags,
                 base_index,
                 normal_index,
@@ -1266,6 +1863,96 @@ impl Model {
         } else {
             Ok(Some(mesh))
         }
+    }
+    /// Every visible (non-passable) surface's local-space textured mesh,
+    /// paired with the object index of its material. UV is in texel space
+    /// (not yet divided by the resolved texture's width/height, since that
+    /// is only known once the caller resolves the material); the standard
+    /// Unreal BSP mapping is `texel = dot(point - Base, TextureU/V)`, where
+    /// `Base` is `points[base_index]` and `TextureU`/`TextureV` are
+    /// `vectors[u_index]`/`vectors[v_index]`.
+    fn visual_surfaces(&self) -> Result<Vec<(Option<i32>, VisualMesh)>> {
+        let mut result = Vec::new();
+        for node in &self.nodes {
+            if node.flags & NF_PASSABLE != 0 {
+                continue;
+            }
+            let surface = self
+                .surfaces
+                .get(
+                    usize::try_from(node.surface_index)
+                        .map_err(|_| AppError::InvalidData("negative BSP surface index".into()))?,
+                )
+                .ok_or_else(|| AppError::InvalidData("BSP surface index out of bounds".into()))?;
+            if surface.polygon_flags & PF_PASSABLE != 0 {
+                continue;
+            }
+            let start = usize::try_from(node.vertex_pool_index)
+                .map_err(|_| AppError::InvalidData("negative BSP vertex pool index".into()))?;
+            let count = node.vertex_count as usize;
+            let references = self.vertices.get(start..start + count).ok_or_else(|| {
+                AppError::InvalidData(format!(
+                    "BSP vertex pool range is invalid (start={start}, count={count}, pool={})",
+                    self.vertices.len()
+                ))
+            })?;
+            let positions = references
+                .iter()
+                .map(|vertex| {
+                    self.points
+                        .get(usize::try_from(vertex.vertex_index).unwrap_or(usize::MAX))
+                        .copied()
+                        .ok_or_else(|| {
+                            AppError::InvalidData("BSP point index out of bounds".into())
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if positions.len() < 3 {
+                continue;
+            }
+            let normal = *self
+                .vectors
+                .get(
+                    usize::try_from(surface.normal_index)
+                        .map_err(|_| AppError::InvalidData("negative BSP normal index".into()))?,
+                )
+                .ok_or_else(|| AppError::InvalidData("BSP normal index out of bounds".into()))?;
+            let base = usize::try_from(surface.base_index)
+                .ok()
+                .and_then(|index| self.points.get(index))
+                .copied();
+            let u_vector = usize::try_from(surface.u_index)
+                .ok()
+                .and_then(|index| self.vectors.get(index))
+                .copied();
+            let v_vector = usize::try_from(surface.v_index)
+                .ok()
+                .and_then(|index| self.vectors.get(index))
+                .copied();
+            let uv_basis = base.zip(u_vector).zip(v_vector);
+            let uv_of = |position: Vec3| -> [f32; 2] {
+                match uv_basis {
+                    Some(((base, u_vector), v_vector)) => {
+                        let offset = position - base;
+                        [offset.dot(u_vector), offset.dot(v_vector)]
+                    }
+                    None => [0.0, 0.0],
+                }
+            };
+            let mut mesh = VisualMesh::default();
+            mesh.vertices
+                .extend(positions.iter().copied().map(|position| VisualVertex {
+                    position,
+                    normal,
+                    uv: uv_of(position),
+                }));
+            for index in 2..positions.len() {
+                mesh.indices.extend([0, index as u32 - 1, index as u32]);
+            }
+            let material_index = (surface.material_index != 0).then_some(surface.material_index);
+            result.push((material_index, mesh));
+        }
+        Ok(result)
     }
 }
 
@@ -1482,6 +2169,55 @@ fn terrain_mesh(
     Ok(mesh)
 }
 
+/// Builds a textured mesh for a single terrain tile's own quads (no
+/// neighbouring-tile border, unlike `terrain_mesh`: seams at tile edges are
+/// an accepted v1 gap). UV tiles by grid coordinate divided by the layer's
+/// `UScale`/`VScale`, matching Unreal's terrain texture repeat convention.
+fn terrain_visual_mesh(
+    terrain: &Terrain,
+    heightmap: &Texture,
+    layer: TerrainLayer,
+    position: Vec3,
+    scale: Vec3,
+) -> Result<VisualMesh> {
+    let width = usize::try_from(heightmap.u_size)
+        .map_err(|_| AppError::InvalidData("negative terrain width".into()))?;
+    let height = usize::try_from(heightmap.v_size)
+        .map_err(|_| AppError::InvalidData("negative terrain height".into()))?;
+    if width < 2 || height < 2 {
+        return Err(AppError::InvalidData("terrain must be at least 2x2".into()));
+    }
+    let heights = heightmap.heights()?;
+    let mut mesh = VisualMesh::default();
+    for y in 0..height {
+        for x in 0..width {
+            let value = heights[y * width + x];
+            mesh.vertices.push(VisualVertex {
+                position: Vec3::new(x as f32, y as f32, value as f32) * scale + position,
+                normal: Vec3::new(0.0, 0.0, 1.0),
+                uv: [x as f32 / layer.u_scale, y as f32 / layer.v_scale],
+            });
+        }
+    }
+    for y in 0..height - 1 {
+        for x in 0..width - 1 {
+            if !bit(&terrain.quad_visibility, x + y * width) {
+                continue;
+            }
+            let a = (x + y * width) as u32;
+            let b = (x + 1 + y * width) as u32;
+            let c = (x + 1 + (y + 1) * width) as u32;
+            let d = (x + (y + 1) * width) as u32;
+            if !bit(&terrain.edge_turn, x + y * width) {
+                mesh.indices.extend([a, b, c, a, c, d]);
+            } else {
+                mesh.indices.extend([d, a, b, d, b, c]);
+            }
+        }
+    }
+    Ok(mesh)
+}
+
 fn bit(bytes: &[u8], index: usize) -> bool {
     bytes
         .get(index / 8)
@@ -1551,6 +2287,26 @@ impl Properties {
             Some(Value::Maps(values)) => values,
             _ => &[],
         }
+    }
+    /// Every occurrence of a fixed-size array-of-struct property (for
+    /// example `TerrainInfo.Layers[8]`), in file order. Unlike
+    /// `array_maps` (one dynamic `TArray` read as a single property with
+    /// every element already collected), a fixed C array is serialized as
+    /// one repeated property entry per non-default slot, so every
+    /// occurrence under `name` must be collected instead of just the last.
+    fn all_struct_maps(&self, name: &str) -> Vec<&Properties> {
+        self.0
+            .get(name)
+            .map(|properties| {
+                properties
+                    .iter()
+                    .filter_map(|property| match &property.value {
+                        Value::Maps(maps) => maps.first(),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 #[derive(Clone)]
@@ -1771,9 +2527,6 @@ impl<'a> Reader<'a> {
     fn new(bytes: &'a [u8], pos: usize) -> Self {
         Self { bytes, pos }
     }
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.pos)
-    }
     fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
         let end = self
             .pos
@@ -1907,5 +2660,126 @@ mod tests {
         let error = decrypt(&path).unwrap_err().to_string();
         assert!(error.contains("PHXDAT01"), "{error}");
         let _ = fs::remove_file(path);
+    }
+    #[test]
+    #[ignore = "requires GEODATA_EDITOR_CLIENT pointing to a local real Lineage II client"]
+    fn decodes_real_client_textures_and_visual_scene_material_refs() {
+        let client = std::env::var("GEODATA_EDITOR_CLIENT").expect("set GEODATA_EDITOR_CLIENT");
+        let loader = PackageLoader::new(PathBuf::from(&client), 0, false);
+        let archive = loader.archive("19_17_Classic").expect("load map archive");
+
+        let mut decoded = 0;
+        for (index, export) in archive.exports.iter().enumerate() {
+            if export.class_name != "Texture" {
+                continue;
+            }
+            let object = archive.load_export(index, &loader).expect("load texture");
+            let Object::Texture(texture) = object.as_ref() else {
+                continue;
+            };
+            if let Some(rgba) = &texture.rgba {
+                let expected = texture.u_size.max(0) as usize * texture.v_size.max(0) as usize * 4;
+                assert_eq!(
+                    rgba.len(),
+                    expected,
+                    "{} decoded to the wrong pixel count",
+                    export.object_name
+                );
+                decoded += 1;
+            }
+        }
+        assert!(
+            decoded > 0,
+            "expected at least one decodable DXT/RGBA8 texture"
+        );
+
+        let mut resolved_material = false;
+        for (index, export) in archive.exports.iter().enumerate() {
+            if export.class_name != "StaticMesh" {
+                continue;
+            }
+            let object = archive
+                .load_export(index, &loader)
+                .expect("load static mesh");
+            let Object::StaticMesh(mesh) = object.as_ref() else {
+                continue;
+            };
+            resolved_material |= mesh
+                .materials
+                .iter()
+                .any(|slot| slot.material_index.is_some());
+        }
+        assert!(
+            resolved_material,
+            "expected at least one StaticMesh surface with a resolvable Material index"
+        );
+
+        let mut found_terrain_layer_texture = false;
+        for (index, export) in archive.exports.iter().enumerate() {
+            if export.class_name != "TerrainInfo" {
+                continue;
+            }
+            let object = archive.load_export(index, &loader).expect("load terrain");
+            let Object::Terrain(terrain) = object.as_ref() else {
+                continue;
+            };
+            assert!(
+                !terrain.layers.is_empty(),
+                "expected at least one terrain layer"
+            );
+            let base_layer = terrain.layers[0];
+            let resolved = archive
+                .object_at(base_layer.texture_index, &loader)
+                .expect("base layer texture");
+            if let Object::Texture(texture) = resolved.object.as_ref() {
+                found_terrain_layer_texture = texture.rgba.is_some();
+            }
+        }
+        assert!(
+            found_terrain_layer_texture,
+            "expected the base terrain layer to resolve to a decoded texture"
+        );
+
+        // The material index of a mesh imported from another package is in
+        // *that* package's index space. Resolving it against the map yields
+        // unrelated objects (sounds, classes, packages), which silently
+        // renders as untextured gray, so guard the resolution rate: nearly
+        // every visual surface in a real map has a bitmap behind it.
+        let scene = loader
+            .load_visual_scene("19_17_Classic")
+            .expect("load visual scene");
+        let textured: usize = scene
+            .batches
+            .iter()
+            .filter(|batch| batch.texture.is_some())
+            .map(|batch| batch.indices.len())
+            .sum();
+        let total: usize = scene.batches.iter().map(|batch| batch.indices.len()).sum();
+        assert!(total > 0, "expected a non-empty visual scene");
+        let share = textured as f32 / total as f32;
+        assert!(
+            share > 0.9,
+            "only {:.1}% of the visual scene resolved to a texture",
+            share * 100.0
+        );
+
+        // A zone backdrop sheet (unlit, wavy-flagged, 20 tiles wide, far
+        // below the terrain) used to reach the scene and blanket the whole
+        // horizon with one flat quad. Nothing may span past two tiles.
+        for (index, batch) in scene.batches.iter().enumerate() {
+            let mut min = Vec3::new(f32::MAX, f32::MAX, f32::MAX);
+            let mut max = Vec3::new(f32::MIN, f32::MIN, f32::MIN);
+            for (position, _, _) in &batch.vertices {
+                min.x = min.x.min(position.x);
+                min.z = min.z.min(position.z);
+                max.x = max.x.max(position.x);
+                max.z = max.z.max(position.z);
+            }
+            let span = (max.x - min.x).max(max.z - min.z);
+            assert!(
+                span <= 65_536.0,
+                "batch {index} spans {span:.0} units, more than two region tiles"
+            );
+        }
     }
 }

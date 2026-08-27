@@ -47,6 +47,15 @@ impl MapType {
         }
     }
 
+    /// The other client flavour. A region that is missing under one naming
+    /// scheme is frequently present under the other.
+    pub fn other(self) -> Self {
+        match self {
+            Self::Classic => Self::Normal,
+            Self::Normal => Self::Classic,
+        }
+    }
+
     fn key(self) -> &'static str {
         match self {
             Self::Classic => "classic",

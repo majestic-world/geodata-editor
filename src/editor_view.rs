@@ -4,7 +4,7 @@ use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Instant,
 };
 
@@ -24,13 +24,16 @@ use crate::{
     error::{AppError, Result},
     geometry::{Box3, Triangle, Vec3},
     l2j::{self, Direction, Document, EditableBlockType, Layer, LayerAddress, NULL_HEIGHT},
-    unreal::{PackageLoader, SourceMap},
+    unreal::{PackageLoader, SourceMap, VisualBatch, VisualScene},
 };
 
 /// Opens the standalone editor over the map's collision context.
 pub fn run_editor(options: EditorOptions) -> Result<()> {
     let memory = editor::load_memory();
-    let (source_map, package_count) = editor_source_map(&options)?;
+    let (source_map, package_count, pending_flavour) = editor_source_map(&options)?;
+    // Nothing was loaded when a confirmation is pending: the project opens
+    // through the same path as the Carregar button once the user answers.
+    let loaded_context = pending_flavour.is_none();
     let (document, loaded) = match &options.input {
         Some(path) => (Document::open(path)?, true),
         None => (Document::blank(), false),
@@ -41,11 +44,12 @@ pub fn run_editor(options: EditorOptions) -> Result<()> {
         &event_loop,
         source_map,
         document,
-        loaded && options.client_root.is_some(),
+        loaded && options.client_root.is_some() && loaded_context,
         package_count,
         options,
         memory,
     ))?;
+    editor.ui.pending_flavour = pending_flavour;
     event_loop
         .run(move |event, target| {
             target.set_control_flow(ControlFlow::Poll);
@@ -108,17 +112,112 @@ fn escape_pressed(event: &WindowEvent) -> bool {
     )
 }
 
-fn editor_source_map(options: &EditorOptions) -> Result<(SourceMap, usize)> {
+/// A confirmation the editor is waiting on: the selected client flavour has
+/// no package for the region, but the other one does.
+///
+/// The prompt is drawn by egui rather than by a native dialog on purpose. A
+/// blocking `MessageBox` invoked from inside winit's event-loop callback is
+/// created with the right owner and geometry but never becomes visible on
+/// Windows, so the app just freezes with no prompt in sight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingFlavour {
+    /// Package the user's current selection asked for, and which is absent.
+    missing: String,
+    /// Package that does exist, and the flavour it belongs to.
+    available: String,
+    available_type: MapType,
+}
+
+impl PendingFlavour {
+    fn question(&self) -> String {
+        format!(
+            "O mapa {} não existe, mas o {} existe. Quer usar ele?",
+            self.missing, self.available
+        )
+    }
+}
+
+/// What the client actually ships for a region, before asking anything.
+#[derive(Debug, PartialEq, Eq)]
+enum PackageAvailability {
+    /// The selected map type's package is there.
+    Selected(String),
+    /// Only the other flavour is there.
+    OnlyOther(MapType, String),
+    Neither,
+}
+
+/// A classic client names a region `25_25_Classic` and a normal one `25_25`,
+/// and plenty of clients ship only one of the two for a given region.
+fn map_package_availability(
+    loader: &PackageLoader,
+    region: &str,
+    map_type: MapType,
+) -> PackageAvailability {
+    let selected = map_type.package_name(region);
+    if loader.has_package(&selected) {
+        return PackageAvailability::Selected(selected);
+    }
+    let other_type = map_type.other();
+    let other = other_type.package_name(region);
+    if loader.has_package(&other) {
+        return PackageAvailability::OnlyOther(other_type, other);
+    }
+    PackageAvailability::Neither
+}
+
+/// Turns availability into either a package to load right away or a
+/// confirmation to put in front of the user.
+fn map_package_or_prompt(
+    loader: &PackageLoader,
+    region: &str,
+    map_type: MapType,
+) -> std::result::Result<String, Option<PendingFlavour>> {
+    match map_package_availability(loader, region, map_type) {
+        PackageAvailability::Selected(package) => Ok(package),
+        PackageAvailability::Neither => Err(None),
+        PackageAvailability::OnlyOther(available_type, available) => Err(Some(PendingFlavour {
+            missing: map_type.package_name(region),
+            available,
+            available_type,
+        })),
+    }
+}
+
+/// Loads the collision context for the CLI-provided project, if any.
+///
+/// When the region only exists under the other client flavour, nothing is
+/// loaded and the confirmation is handed back so the editor can ask inside
+/// its own UI, on the welcome screen.
+fn editor_source_map(
+    options: &EditorOptions,
+) -> Result<(SourceMap, usize, Option<PendingFlavour>)> {
     if let (Some(root), Some(input)) = (&options.client_root, &options.input) {
         let region = editor::geodata_region(input).ok_or_else(|| {
             AppError::InvalidArgument(format!("invalid geodata name: {}", input.display()))
         })?;
-        let package = options.map_type.unwrap_or_default().package_name(&region);
+        let map_type = options.map_type.unwrap_or_default();
         let loader = PackageLoader::new(root.clone(), 0, false);
-        let source = loader.load_map(&package)?;
-        let count = loader.loaded_package_count();
-        return Ok((source, count));
+        match map_package_or_prompt(&loader, &region, map_type) {
+            Ok(package) => {
+                let source = loader.load_map(&package)?;
+                let count = loader.loaded_package_count();
+                return Ok((source, count, None));
+            }
+            Err(None) => {
+                return Err(AppError::Missing(format!(
+                    "can't find package: {}",
+                    map_type.package_name(&region)
+                )));
+            }
+            Err(Some(pending)) => return Ok((welcome_source_map(options), 0, Some(pending))),
+        }
     }
+    Ok((welcome_source_map(options), 0, None))
+}
+
+/// Placeholder map shown while no project is loaded.
+fn welcome_source_map(options: &EditorOptions) -> SourceMap {
     let name = options
         .input
         .as_ref()
@@ -126,24 +225,24 @@ fn editor_source_map(options: &EditorOptions) -> Result<(SourceMap, usize)> {
         .and_then(|name| name.to_str())
         .unwrap_or("Selecione o cliente e a geodata")
         .to_owned();
-    Ok((
-        SourceMap {
-            name,
-            // Only used while the welcome screen is visible. A real map is
-            // required before the document can be shown or edited.
-            bounds: Box3::new(
-                Vec3::new(0.0, -32_768.0, 0.0),
-                Vec3::new(32_768.0, 32_768.0, 32_768.0),
-            ),
-            triangles: Vec::new(),
-            geometry: Default::default(),
-        },
-        0,
-    ))
+    SourceMap {
+        name,
+        // Only used while the welcome screen is visible. A real map is
+        // required before the document can be shown or edited.
+        bounds: Box3::new(
+            Vec3::new(0.0, -32_768.0, 0.0),
+            Vec3::new(32_768.0, 32_768.0, 32_768.0),
+        ),
+        triangles: Vec::new(),
+        geometry: Default::default(),
+    }
 }
 
 const WINDOW_TITLE: &str = concat!("Geodata Editor By Mk — v", env!("CARGO_PKG_VERSION"));
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+/// 4x is the universally supported multisample count and already removes
+/// nearly all of the aliasing on this scene's long thin silhouettes.
+const MSAA_SAMPLE_COUNT: u32 = 4;
 const MOUSE_LOOK_SENSITIVITY: f32 = 0.002;
 const MOUSE_ELEVATION_SENSITIVITY: f32 = 0.0012;
 // Keyboard navigation is intentionally precise; hold Shift to return to the
@@ -158,6 +257,7 @@ struct Preview {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     depth_view: wgpu::TextureView,
+    msaa_view: wgpu::TextureView,
     triangle_pipeline: wgpu::RenderPipeline,
     triangle_no_cull_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
@@ -165,6 +265,8 @@ struct Preview {
     geodata_overlay_pipeline: wgpu::RenderPipeline,
     nswe_icon_pipeline: wgpu::RenderPipeline,
     nswe_icon_bind_group: wgpu::BindGroup,
+    textured_pipeline: wgpu::RenderPipeline,
+    material_texture_layout: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera: Camera,
@@ -291,7 +393,11 @@ impl Preview {
             create_geodata_overlay_pipeline(&device, &camera_layout, format);
         let (nswe_icon_pipeline, nswe_icon_bind_group) =
             create_nswe_icon_resources(&device, &queue, &camera_layout, format);
+        let material_texture_layout = create_material_texture_layout(&device);
+        let textured_pipeline =
+            create_textured_pipeline(&device, &camera_layout, &material_texture_layout, format);
         let depth_view = create_depth_view(&device, &config);
+        let msaa_view = create_msaa_view(&device, &config);
         let collision_meshes = CollisionMeshes::new(&device, &source_map, origin);
 
         let egui_context = egui::Context::default();
@@ -303,7 +409,8 @@ impl Preview {
             Some(window.scale_factor() as f32),
             None,
         );
-        let egui_renderer = egui_wgpu::Renderer::new(&device, format, Some(DEPTH_FORMAT), 1);
+        let egui_renderer =
+            egui_wgpu::Renderer::new(&device, format, Some(DEPTH_FORMAT), MSAA_SAMPLE_COUNT);
 
         Ok(Self {
             window,
@@ -313,6 +420,7 @@ impl Preview {
             config,
             size,
             depth_view,
+            msaa_view,
             triangle_pipeline,
             triangle_no_cull_pipeline,
             line_pipeline,
@@ -320,6 +428,8 @@ impl Preview {
             geodata_overlay_pipeline,
             nswe_icon_pipeline,
             nswe_icon_bind_group,
+            textured_pipeline,
+            material_texture_layout,
             camera_buffer,
             camera_bind_group,
             camera,
@@ -343,6 +453,7 @@ impl Preview {
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = create_depth_view(&self.device, &self.config);
+        self.msaa_view = create_msaa_view(&self.device, &self.config);
     }
 
     fn camera_input(&mut self, event: &WindowEvent) {
@@ -509,6 +620,9 @@ struct EditorView {
     /// One icon for every NSWE mask. They are embedded in the executable, so
     /// the distributed editor keeps working without an adjacent data folder.
     nswe_icons: [egui::TextureHandle; 16],
+    /// Cached GPU form of the textured visualization, built lazily the
+    /// first time `ui.textured_view` is enabled for the current project.
+    textured_scene: Option<TexturedScene>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -555,9 +669,16 @@ struct EditorUi {
     brush_anchor: BrushAnchor,
     visual_stride: usize,
     show_nswe_icons: bool,
+    textured_view: bool,
     show_selected_layer_only: bool,
     show_all_open_cells: bool,
     hide_fully_open_blocks: bool,
+    /// Hides every geodata overlay so only the map itself is visible.
+    /// Purely a draw-time filter, so toggling it never rebuilds a mesh.
+    hide_all_blocks: bool,
+    /// Waiting on the user to accept the other client flavour for the
+    /// selected region, drawn as an in-app prompt.
+    pending_flavour: Option<PendingFlavour>,
     open_context_radius: usize,
     height_input: i32,
     height_input_address: Option<LayerAddress>,
@@ -831,6 +952,7 @@ impl EditorView {
             geodata_mesh,
             nswe_icon_mesh,
             nswe_icons,
+            textured_scene: None,
         };
         if view.loaded && view.has_context {
             let _ = view.persist_memory();
@@ -1009,11 +1131,13 @@ impl EditorView {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("editor-render-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: &self.preview.msaa_view,
+                    resolve_target: Some(&view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
+                        // The multisampled samples are only needed for the
+                        // resolve, never read back afterwards.
+                        store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1028,9 +1152,19 @@ impl EditorView {
                 occlusion_query_set: None,
             });
             if self.has_context {
-                self.preview.draw_collision_meshes(&mut pass, false);
+                match (self.ui.textured_view, &self.textured_scene) {
+                    (true, Some(scene)) => {
+                        scene.draw(
+                            &mut pass,
+                            &self.preview.textured_pipeline,
+                            &self.preview.camera_bind_group,
+                        );
+                    }
+                    _ => self.preview.draw_collision_meshes(&mut pass, false),
+                }
             }
-            if self.loaded && self.has_context {
+            let blocks_visible = self.loaded && self.has_context && !self.ui.hide_all_blocks;
+            if blocks_visible {
                 draw_geodata(
                     &mut pass,
                     &self.preview.geodata_overlay_pipeline,
@@ -1054,7 +1188,7 @@ impl EditorView {
                 if self.has_context {
                     self.preview.draw_collision_meshes(&mut pass, true);
                 }
-                if self.loaded && self.has_context {
+                if blocks_visible {
                     draw_geodata(
                         &mut pass,
                         &self.preview.geodata_line_pipeline,
@@ -1101,10 +1235,50 @@ impl EditorView {
                         self.draw_editor_inspector(ui, &mut action, &mut visual_changed);
                     });
             });
+        self.draw_flavour_prompt(context, &mut action);
         self.apply(action);
         if visual_changed && self.loaded && self.has_context {
             self.refresh_editor_meshes();
         }
+    }
+
+    /// In-app confirmation for the missing map flavour.
+    ///
+    /// Drawn with egui instead of a native message box: a blocking
+    /// `MessageBox` called from inside winit's event-loop callback never
+    /// becomes visible on Windows, which freezes the editor behind a prompt
+    /// nobody can see.
+    fn draw_flavour_prompt(&mut self, context: &egui::Context, action: &mut EditorAction) {
+        let Some(pending) = self.ui.pending_flavour.clone() else {
+            return;
+        };
+        egui::Window::new("Mapa não encontrado")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(context, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(pending.question());
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(format!("Usar {}", pending.available))
+                        .on_hover_text("Troca o tipo de mapa e carrega o projeto.")
+                        .clicked()
+                    {
+                        self.ui.map_type = pending.available_type;
+                        self.ui.pending_flavour = None;
+                        *action = EditorAction::OpenProject;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        self.ui.pending_flavour = None;
+                        self.ui.status = format!(
+                            "O mapa {} não existe no cliente informado.",
+                            pending.missing
+                        );
+                    }
+                });
+            });
     }
 
     fn draw_editor_toolbar(&mut self, ui: &mut egui::Ui, action: &mut EditorAction) {
@@ -1148,6 +1322,12 @@ impl EditorView {
             ui.checkbox(&mut self.preview.ui.wireframe, "Wireframe");
             ui.checkbox(&mut self.preview.ui.culling, "Culling");
             ui.checkbox(&mut self.ui.show_nswe_icons, "NSWE");
+            if ui.checkbox(&mut self.ui.textured_view, "Textura").changed()
+                && self.ui.textured_view
+                && self.textured_scene.is_none()
+            {
+                self.enable_textured_view();
+            }
             ui.separator();
             toolbar_section_label(ui, "TEMA", theme_accent(self.ui.theme));
             if ui.button(self.ui.theme.toggled().label()).clicked() {
@@ -1584,6 +1764,24 @@ impl EditorView {
     }
 
     fn draw_visualization_section(&mut self, ui: &mut egui::Ui, visual_changed: &mut bool) {
+        // Draw-time only: no mesh rebuild, so this is not a `visual_changed`.
+        ui.checkbox(&mut self.ui.hide_all_blocks, "Ocultar todos os blocos")
+            .on_hover_text("Exibe apenas o mapa, sem nenhum bloco de geodata.");
+        ui.add_enabled_ui(!self.ui.hide_all_blocks, |ui| {
+            self.draw_block_visibility_options(ui, visual_changed);
+        });
+        ui.small("Mouse direito: olhar · esquerdo + direito: subir/descer.");
+        ui.add_space(4.0);
+        ui.label(format!(
+            "{} blocos alterados",
+            self.document.changed_blocks()
+        ));
+        if self.has_context {
+            ui.small(format!("{} pacotes de contexto", self.package_count));
+        }
+    }
+
+    fn draw_block_visibility_options(&mut self, ui: &mut egui::Ui, visual_changed: &mut bool) {
         *visual_changed |= ui
             .checkbox(
                 &mut self.ui.hide_fully_open_blocks,
@@ -1617,15 +1815,6 @@ impl EditorView {
         });
         if self.ui.hide_fully_open_blocks {
             ui.small("Somente células com algum bloqueio permanecem visíveis.");
-        }
-        ui.small("Mouse direito: olhar · esquerdo + direito: subir/descer.");
-        ui.add_space(4.0);
-        ui.label(format!(
-            "{} blocos alterados",
-            self.document.changed_blocks()
-        ));
-        if self.has_context {
-            ui.small(format!("{} pacotes de contexto", self.package_count));
         }
     }
 
@@ -1899,7 +2088,7 @@ impl EditorView {
             return;
         }
         let path = PathBuf::from(geodata_text);
-        let Some(package) = self.map_package() else {
+        let Some(region) = editor::geodata_region(&path) else {
             self.ui.status = format!("Nome de geodata inválido: {}", path.display());
             return;
         };
@@ -1911,6 +2100,22 @@ impl EditorView {
             }
         };
         let loader = PackageLoader::new(client_root, 0, false);
+        let package = match map_package_or_prompt(&loader, &region, self.ui.map_type) {
+            Ok(package) => package,
+            Err(Some(pending)) => {
+                // Ask in-app and come back through this same method once the
+                // user answers.
+                self.ui.status = pending.question();
+                self.ui.pending_flavour = Some(pending);
+                return;
+            }
+            Err(None) => {
+                let missing = self.ui.map_type.package_name(&region);
+                self.ui.status = format!("O mapa {missing} não existe no cliente informado.");
+                return;
+            }
+        };
+        self.ui.pending_flavour = None;
         let source_map = match loader.load_map(&package) {
             Ok(source_map) => source_map,
             Err(error) => {
@@ -1933,6 +2138,14 @@ impl EditorView {
             map_origin(self.preview.source_map.bounds),
         );
         self.preview.camera.reset(self.preview.source_map.bounds);
+        // Only now that `source_map` is the newly loaded map: the textured
+        // scene is rebased onto `map_origin(source_map.bounds)`, so building
+        // it any earlier anchors it to the previous map's centre and puts it
+        // tens of thousands of units away from the camera.
+        self.textured_scene = None;
+        if self.ui.textured_view {
+            self.apply_visual_scene(&loader, &package);
+        }
         self.loaded = true;
         self.has_context = true;
 
@@ -2185,6 +2398,48 @@ impl EditorView {
             self.ui.selection.len()
         );
         self.refresh_editor_meshes();
+    }
+
+    /// Turns the textured visualization on: builds a fresh `PackageLoader`
+    /// from the current project settings and loads/decodes/uploads its
+    /// visual scene. Heavier than opening the project (every referenced
+    /// texture is decoded), so this only runs when the toggle is enabled.
+    fn enable_textured_view(&mut self) {
+        if !self.loaded || !self.has_context {
+            self.ui.status =
+                "Carregue um projeto antes de ativar a visualização texturizada.".into();
+            self.ui.textured_view = false;
+            return;
+        }
+        let Some(package) = self.map_package() else {
+            self.ui.status = "Nome de geodata inválido para carregar texturas.".into();
+            self.ui.textured_view = false;
+            return;
+        };
+        let loader = PackageLoader::new(PathBuf::from(self.ui.client_root.trim()), 0, false);
+        self.apply_visual_scene(&loader, &package);
+    }
+
+    fn apply_visual_scene(&mut self, loader: &PackageLoader, package: &str) {
+        match loader.load_visual_scene(package) {
+            Ok(scene) => {
+                let batch_count = scene.batches.len();
+                self.textured_scene = Some(TexturedScene::new(
+                    &self.preview.device,
+                    &self.preview.queue,
+                    &self.preview.material_texture_layout,
+                    &scene,
+                    map_origin(self.preview.source_map.bounds),
+                ));
+                self.ui.status =
+                    format!("Visualização texturizada carregada: {batch_count} lote(s).");
+            }
+            Err(error) => {
+                self.textured_scene = None;
+                self.ui.textured_view = false;
+                self.ui.status = format!("Falha ao carregar visualização texturizada: {error}");
+            }
+        }
     }
 }
 fn brush_size(requested_size: usize) -> usize {
@@ -3467,6 +3722,135 @@ impl CollisionMeshes {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TexturedVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+    uv: [f32; 2],
+}
+
+impl TexturedVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+/// One draw call of the textured visualization: every triangle sharing the
+/// same material texture, already uploaded to the GPU.
+struct TexturedBatch {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+    material: wgpu::BindGroup,
+}
+
+/// GPU-resident form of `unreal::VisualScene`, built once when the textured
+/// view is enabled (or a new project loads while it's already enabled).
+struct TexturedScene {
+    batches: Vec<TexturedBatch>,
+}
+
+impl TexturedScene {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        material_layout: &wgpu::BindGroupLayout,
+        scene: &VisualScene,
+        origin: Vec3,
+    ) -> Self {
+        let batches = scene
+            .batches
+            .iter()
+            .filter(|batch| !batch.indices.is_empty())
+            .map(|batch| {
+                let vertices = textured_batch_vertices(batch, origin);
+                let material = match &batch.texture {
+                    Some(texture) if texture.width > 0 && texture.height > 0 => {
+                        create_material_bind_group(
+                            device,
+                            queue,
+                            material_layout,
+                            texture.width,
+                            texture.height,
+                            &texture.rgba,
+                        )
+                    }
+                    _ => create_material_bind_group(
+                        device,
+                        queue,
+                        material_layout,
+                        1,
+                        1,
+                        &FALLBACK_MATERIAL_RGBA,
+                    ),
+                };
+                TexturedBatch {
+                    vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("editor-textured-batch-vertices"),
+                        contents: bytemuck::cast_slice(&vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+                    indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("editor-textured-batch-indices"),
+                        contents: bytemuck::cast_slice(&batch.indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    }),
+                    index_count: batch.indices.len() as u32,
+                    material,
+                }
+            })
+            .collect();
+        Self { batches }
+    }
+
+    fn draw<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        pipeline: &'a wgpu::RenderPipeline,
+        camera: &'a wgpu::BindGroup,
+    ) {
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, camera, &[]);
+        for batch in &self.batches {
+            pass.set_bind_group(1, &batch.material, &[]);
+            pass.set_vertex_buffer(0, batch.vertices.slice(..));
+            pass.set_index_buffer(batch.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..batch.index_count, 0, 0..1);
+        }
+    }
+}
+
+/// Rebases a visual batch onto the preview's origin-relative space.
+///
+/// `VisualScene` carries absolute Lineage II world coordinates, but every
+/// mesh the preview renders (collision geometry, geodata cells, NSWE icons)
+/// is expressed relative to `map_origin` so the camera can work near zero
+/// and keep f32 precision. Skipping this rebase puts the textured scene
+/// tens of thousands of units away from the geodata it is meant to overlay.
+fn textured_batch_vertices(batch: &VisualBatch, origin: Vec3) -> Vec<TexturedVertex> {
+    batch
+        .vertices
+        .iter()
+        .map(|(position, normal, uv)| TexturedVertex {
+            position: [
+                position.x - origin.x,
+                position.y - origin.y,
+                position.z - origin.z,
+            ],
+            normal: [normal.x, normal.y, normal.z],
+            uv: *uv,
+        })
+        .collect()
+}
+
 fn source_collision_mesh(triangles: &[Triangle], origin: Vec3, color: [f32; 4]) -> CpuMesh {
     let mut mesh = CpuMesh::default();
     for triangle in triangles {
@@ -3848,7 +4232,7 @@ fn create_pipelines(
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: msaa_state(),
             multiview: None,
         })
     };
@@ -3925,7 +4309,7 @@ fn create_geodata_pipelines(
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: msaa_state(),
             multiview: None,
         })
     };
@@ -3997,7 +4381,7 @@ fn create_geodata_overlay_pipeline(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: msaa_state(),
         multiview: None,
     })
 }
@@ -4134,10 +4518,260 @@ fn create_nswe_icon_resources(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: msaa_state(),
         multiview: None,
     });
     (pipeline, bind_group)
+}
+
+/// Bind group layout shared by every material texture in the textured
+/// visualization. Kept separate from the NSWE icon atlas layout because
+/// material textures need `Repeat` addressing (terrain/wall tiling) instead
+/// of the icon atlas's `ClampToEdge`.
+fn create_material_texture_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("editor-material-texture-layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+/// sRGB byte -> linear float, for the 256 possible channel values.
+///
+/// The client's bitmaps are sRGB-encoded and the GPU samples them through
+/// `Rgba8UnormSrgb`, so any CPU-side filtering has to leave gamma space too:
+/// averaging the raw bytes darkens every mip level (a 0/255 checkerboard
+/// averages to 128, which is ~22% light instead of 50%), which is exactly
+/// what makes a distant tiled wall read as a dark smear.
+static SRGB_TO_LINEAR: LazyLock<[f32; 256]> = LazyLock::new(|| {
+    let mut table = [0.0; 256];
+    for (value, slot) in table.iter_mut().enumerate() {
+        let channel = value as f32 / 255.0;
+        *slot = if channel <= 0.040_45 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        };
+    }
+    table
+});
+
+fn linear_to_srgb(channel: f32) -> u8 {
+    let encoded = if channel <= 0.003_130_8 {
+        channel * 12.92
+    } else {
+        1.055 * channel.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+}
+
+/// Downsamples one RGBA8 level to half its size using a 2×2 box filter in
+/// linear light (clamping at odd edges). Used to build a full mip chain on
+/// the CPU, since decoded client textures arrive as a single top-level
+/// bitmap. Alpha is linear already, so it is averaged directly.
+fn downsample_rgba(width: u32, height: u32, rgba: &[u8]) -> (u32, u32, Vec<u8>) {
+    let next_width = (width / 2).max(1);
+    let next_height = (height / 2).max(1);
+    let to_linear = &*SRGB_TO_LINEAR;
+    let at = |x: u32, y: u32| -> usize {
+        let x = x.min(width - 1);
+        let y = y.min(height - 1);
+        ((y * width + x) * 4) as usize
+    };
+    let mut next = vec![0u8; (next_width * next_height * 4) as usize];
+    for y in 0..next_height {
+        for x in 0..next_width {
+            let corners = [
+                at(x * 2, y * 2),
+                at(x * 2 + 1, y * 2),
+                at(x * 2, y * 2 + 1),
+                at(x * 2 + 1, y * 2 + 1),
+            ];
+            let target = ((y * next_width + x) * 4) as usize;
+            for channel in 0..3 {
+                let sum: f32 = corners
+                    .iter()
+                    .map(|corner| to_linear[rgba[corner + channel] as usize])
+                    .sum();
+                next[target + channel] = linear_to_srgb(sum * 0.25);
+            }
+            let alpha: u32 = corners
+                .iter()
+                .map(|corner| rgba[corner + 3] as u32)
+                .sum::<u32>();
+            next[target + 3] = (alpha / 4) as u8;
+        }
+    }
+    (next_width, next_height, next)
+}
+
+/// Uploads one RGBA8 texture (with a full generated mip chain) and wraps it
+/// in a bind group matching `create_material_texture_layout`. Without
+/// mipmaps, the densely tiled terrain/wall textures alias into visible
+/// per-pixel noise as soon as the camera is more than a few quads away, so
+/// every material texture gets a complete chain down to 1×1.
+/// `width`/`height` must agree with `rgba.len() == width * height * 4`.
+fn create_material_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> wgpu::BindGroup {
+    let mut mips = vec![(width, height, rgba.to_vec())];
+    while {
+        let (level_width, level_height, _) = mips.last().unwrap();
+        *level_width > 1 || *level_height > 1
+    } {
+        let (level_width, level_height, level_rgba) = mips.last().unwrap();
+        mips.push(downsample_rgba(*level_width, *level_height, level_rgba));
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("editor-material-texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: mips.len() as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (level, (level_width, level_height, level_rgba)) in mips.iter().enumerate() {
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            level_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * level_width),
+                rows_per_image: Some(*level_height),
+            },
+            wgpu::Extent3d {
+                width: *level_width,
+                height: *level_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("editor-material-sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Linear,
+        // Terrain and wall textures are almost always seen at a grazing
+        // angle, where isotropic mip selection blurs along the wrong axis
+        // and smears the tiling into vertical streaks. All three filters
+        // are Linear, which is what wgpu requires to accept this.
+        anisotropy_clamp: 8,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("editor-material-bind-group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    })
+}
+
+/// Flat neutral gray used for surfaces whose material didn't resolve to a
+/// decodable texture (unsupported format, or a Shader/Combiner/FinalBlend
+/// material graph not modelled yet).
+const FALLBACK_MATERIAL_RGBA: [u8; 4] = [170, 170, 170, 255];
+
+/// No cull mode: unlike the collision debug mesh, static mesh/BSP winding
+/// isn't normalized for the textured visualization (see
+/// `VisualMesh::append`), so double-sided rendering avoids missing faces at
+/// the cost of not culling backfaces.
+fn create_textured_pipeline(
+    device: &wgpu::Device,
+    camera_layout: &wgpu::BindGroupLayout,
+    material_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("editor-textured-shader"),
+        source: wgpu::ShaderSource::Wgsl(TEXTURED_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("editor-textured-pipeline-layout"),
+        bind_group_layouts: &[camera_layout, material_layout],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("editor-textured-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[TexturedVertex::layout()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                // The shader cuts masked texels out instead of blending
+                // them, so the pass stays opaque and depth-correct.
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: msaa_state(),
+        multiview: None,
+    })
 }
 
 fn nswe_icon_atlas() -> Vec<u8> {
@@ -4158,6 +4792,15 @@ fn nswe_icon_atlas() -> Vec<u8> {
     atlas
 }
 
+/// Multisample state shared by every pipeline drawing into the preview's
+/// render pass. All of them must agree with the attachments' sample count.
+fn msaa_state() -> wgpu::MultisampleState {
+    wgpu::MultisampleState {
+        count: MSAA_SAMPLE_COUNT,
+        ..Default::default()
+    }
+}
+
 fn create_depth_view(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
@@ -4171,9 +4814,34 @@ fn create_depth_view(
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: MSAA_SAMPLE_COUNT,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Offscreen multisampled colour target. The pass renders here and resolves
+/// into the swapchain texture, which is what removes the stair-stepping on
+/// mesh silhouettes and on the geodata cell quads.
+fn create_msaa_view(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("preview-msaa-color"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLE_COUNT,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         })
@@ -4413,10 +5081,588 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const TEXTURED_SHADER: &str = r#"
+struct Camera {
+    view_projection: mat4x4<f32>,
+    position: vec3<f32>,
+    _padding: f32,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: Camera;
+
+@group(1) @binding(0)
+var material_texture: texture_2d<f32>;
+@group(1) @binding(1)
+var material_sampler: sampler;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) world_position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+};
+
+// Stand-in for the client's baked lightmaps, which this viewer cannot read.
+// The three terms are budgeted so a surface facing both the sun and the
+// camera lands just under 1.0: any more and light-coloured stone clips to
+// flat white and loses all its texture detail.
+const SKY_COLOR: vec3<f32> = vec3<f32>(0.36, 0.39, 0.45);
+const GROUND_COLOR: vec3<f32> = vec3<f32>(0.20, 0.18, 0.16);
+const SUN_DIRECTION: vec3<f32> = vec3<f32>(0.45, 0.80, 0.40);
+const SUN_COLOR: vec3<f32> = vec3<f32>(1.05, 0.98, 0.88);
+const SUN_INTENSITY: f32 = 0.50;
+const HEADLAMP_INTENSITY: f32 = 0.12;
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.position = camera.view_projection * vec4<f32>(input.position, 1.0);
+    output.world_position = input.position;
+    output.normal = input.normal;
+    output.uv = input.uv;
+    return output;
+}
+
+// Lighting has to stand in for the client's baked lightmaps, which this
+// viewer has no access to. A camera headlamp alone leaves every surface
+// facing away from the viewer flat black, so the shading is built from
+// three cheap terms that keep detail readable from any angle:
+//   * a hemisphere ambient (sky above, bounce below) that never reaches 0,
+//   * a fixed world sun, so geometry keeps stable orientation cues while
+//     the camera moves,
+//   * a weak headlamp, which keeps caves and interiors legible.
+// All of it runs in linear light: the texture is sampled through an sRGB
+// view and the surface re-encodes on write.
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let sample = textureSample(material_texture, material_sampler, input.uv);
+    // Masked foliage and grate textures are authored with a hard alpha
+    // edge. Cutting them out keeps depth correct, instead of the halos
+    // and sorting artefacts a blend produces on unsorted geometry.
+    if sample.a < 0.35 {
+        discard;
+    }
+
+    let normal = normalize(input.normal);
+    let view_direction = normalize(camera.position - input.world_position);
+
+    // Everything below uses the stored normal as-is, and every two-sided
+    // term uses the magnitude of its angle.
+    //
+    // Flipping the normal to face the viewer (`dot(normal, view) < 0`) is
+    // the obvious way to light single-sided walls and leaf cards, and it is
+    // a trap: for any up-facing surface that dot changes sign exactly at
+    // the camera's altitude, and the points at the camera's altitude
+    // project to a perfectly straight horizontal line. The result is a
+    // razor-sharp seam across the screen at eye level, with all the terrain
+    // beyond it flipped to lit-from-below. The rasterizer's `front_facing`
+    // is no help either: this scene's winding does not agree with its
+    // normals (hence `cull_mode: None`), so it darkens the terrain wholesale.
+    let hemisphere = mix(GROUND_COLOR, SKY_COLOR, normal.y * 0.5 + 0.5);
+    // Two-sided wrapped diffuse: the magnitude keeps a card lit from either
+    // side, and the wrap softens the terminator so a surface just past
+    // grazing incidence still shows its texture instead of going black.
+    let sun = max((abs(dot(normal, normalize(SUN_DIRECTION))) + 0.3) / 1.3, 0.0);
+    let headlamp = HEADLAMP_INTENSITY * abs(dot(normal, view_direction));
+    let light = hemisphere + SUN_COLOR * (sun * SUN_INTENSITY) + vec3<f32>(headlamp);
+
+    return vec4<f32>(sample.rgb * light, 1.0);
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Renders one full-viewport, up-facing triangle through the real
+    /// textured pipeline and returns the resolved frame. Exercises the WGSL,
+    /// the MSAA attachments and the resolve in one shot.
+    ///
+    /// The triangle's world positions are its NDC positions (the view
+    /// projection is identity), so `camera_position[1]` decides where the
+    /// camera's eye level falls inside the frame.
+    fn render_textured_frame(texel: [u8; 4], camera_position: [f32; 3]) -> Option<(u32, Vec<u8>)> {
+        const SIDE: u32 = 64;
+
+        let instance = wgpu::Instance::default();
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("shading-test-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+            },
+            None,
+        ))
+        .ok()?;
+
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        // Identity view projection: vertices are given directly in NDC.
+        let camera = CameraUniform::new(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            camera_position,
+        );
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&camera),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        let material_layout = create_material_texture_layout(&device);
+        let material = create_material_bind_group(&device, &queue, &material_layout, 1, 1, &texel);
+        let pipeline = create_textured_pipeline(&device, &camera_layout, &material_layout, format);
+
+        // Normal points up, so the sun and the overhead camera both hit it.
+        let vertices = [
+            TexturedVertex {
+                position: [-1.0, -1.0, 0.0],
+                normal: [0.0, 1.0, 0.0],
+                uv: [0.0, 0.0],
+            },
+            TexturedVertex {
+                position: [3.0, -1.0, 0.0],
+                normal: [0.0, 1.0, 0.0],
+                uv: [0.0, 0.0],
+            },
+            TexturedVertex {
+                position: [-1.0, 3.0, 0.0],
+                normal: [0.0, 1.0, 0.0],
+                uv: [0.0, 0.0],
+            },
+        ];
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[0u32, 1, 2]),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: SIDE,
+            height: SIDE,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        let depth_view = create_depth_view(&device, &config);
+        let msaa_view = create_msaa_view(&device, &config);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: SIDE,
+                height: SIDE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (SIDE * SIDE * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &msaa_view,
+                    resolve_target: Some(&target_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &camera_bind_group, &[]);
+            pass.set_bind_group(1, &material, &[]);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..3, 0, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(SIDE * 4),
+                    rows_per_image: Some(SIDE),
+                },
+            },
+            wgpu::Extent3d {
+                width: SIDE,
+                height: SIDE,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        Some((SIDE, data.to_vec()))
+    }
+
+    /// Centre pixel of the default overhead-camera frame.
+    fn render_textured_pixel(texel: [u8; 4]) -> Option<[u8; 4]> {
+        let (side, pixels) = render_textured_frame(texel, [0.0, 1000.0, 0.0])?;
+        let middle = ((side / 2 * side + side / 2) * 4) as usize;
+        Some([
+            pixels[middle],
+            pixels[middle + 1],
+            pixels[middle + 2],
+            pixels[middle + 3],
+        ])
+    }
+
+    /// Renders a client map's textured scene offscreen and writes it to a
+    /// PNG, through the same pipeline, MSAA attachments and resolve the
+    /// editor uses. This is how a render artefact gets inspected without
+    /// driving the GUI window.
+    ///
+    /// `GEODATA_EDITOR_MAP` picks the package (default `17_22_Classic`) and
+    /// `GEODATA_EDITOR_CAM` ("x,y,z,yaw_deg,pitch_deg") replaces the
+    /// overview shot with a specific viewpoint.
+    #[test]
+    #[ignore = "renders a PNG for human inspection; requires GEODATA_EDITOR_CLIENT and a GPU"]
+    fn renders_client_map_to_png() {
+        const WIDTH: u32 = 1280;
+        const HEIGHT: u32 = 720;
+
+        let client = std::env::var("GEODATA_EDITOR_CLIENT").expect("set GEODATA_EDITOR_CLIENT");
+        let package = std::env::var("GEODATA_EDITOR_MAP").unwrap_or("17_22_Classic".into());
+        let loader = PackageLoader::new(PathBuf::from(&client), 0, false);
+        let source_map = loader.load_map(&package).expect("load map");
+        let scene = loader
+            .load_visual_scene(&package)
+            .expect("load visual scene");
+        let origin = map_origin(source_map.bounds);
+
+        let instance = wgpu::Instance::default();
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("no GPU adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("offscreen-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+            },
+            None,
+        ))
+        .expect("create device");
+
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let mut camera = Camera::for_bounds(source_map.bounds);
+        // "x,y,z,yaw_deg,pitch_deg" overrides the overview shot.
+        if let Ok(values) = std::env::var("GEODATA_EDITOR_CAM") {
+            let parsed: Vec<f32> = values
+                .split(',')
+                .filter_map(|value| value.trim().parse().ok())
+                .collect();
+            if parsed.len() == 5 {
+                camera.position = [parsed[0], parsed[1], parsed[2]];
+                camera.yaw = parsed[3].to_radians();
+                camera.pitch = parsed[4].to_radians();
+            }
+        }
+        let uniform = CameraUniform::new(camera.matrix(WIDTH, HEIGHT), camera.position);
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        let material_layout = create_material_texture_layout(&device);
+        let pipeline = create_textured_pipeline(&device, &camera_layout, &material_layout, format);
+        let textured = TexturedScene::new(&device, &queue, &material_layout, &scene, origin);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: WIDTH,
+            height: HEIGHT,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        let depth_view = create_depth_view(&device, &config);
+        let msaa_view = create_msaa_view(&device, &config);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (WIDTH * HEIGHT * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &msaa_view,
+                    resolve_target: Some(&target_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            // Isolating a batch is how an overlap between two coincident
+            // surfaces gets attributed to a specific one.
+            let only = std::env::var("GEODATA_EDITOR_ONLY_BATCH")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok());
+            let skip = std::env::var("GEODATA_EDITOR_SKIP_BATCH")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &camera_bind_group, &[]);
+            for (index, batch) in textured.batches.iter().enumerate() {
+                if only.is_some_and(|wanted| wanted != index) || skip == Some(index) {
+                    continue;
+                }
+                pass.set_bind_group(1, &batch.material, &[]);
+                pass.set_vertex_buffer(0, batch.vertices.slice(..));
+                pass.set_index_buffer(batch.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..batch.index_count, 0, 0..1);
+            }
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(WIDTH * 4),
+                    rows_per_image: Some(HEIGHT),
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let pixels = slice.get_mapped_range().to_vec();
+
+        let path = std::env::temp_dir().join(format!("geodata_editor_{package}.png"));
+        let file = std::fs::File::create(&path).expect("create png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), WIDTH, HEIGHT);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .expect("png header")
+            .write_image_data(&pixels)
+            .expect("png data");
+        println!(
+            "camera position {:?} yaw {:.1} pitch {:.1}\nwrote {}",
+            camera.position,
+            camera.yaw.to_degrees(),
+            camera.pitch.to_degrees(),
+            path.display()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn textured_surfaces_are_lit_without_clipping_to_white() {
+        let Some(pixel) = render_textured_pixel([255, 255, 255, 255]) else {
+            panic!("no GPU adapter available");
+        };
+
+        // A white surface facing both the sun and the camera is the
+        // brightest case in the scene. It must stay short of 255: once it
+        // clips, light stone loses every bit of texture detail.
+        for (channel, value) in pixel[..3].iter().enumerate() {
+            assert!(
+                (200..255).contains(value),
+                "channel {channel} rendered {value}, expected a bright but unclipped value"
+            );
+        }
+
+        // Mid-grey must land clearly below the white case, otherwise the
+        // lighting is washing the albedo out.
+        let grey = render_textured_pixel([128, 128, 128, 255]).expect("second render");
+        assert!(
+            grey[0] < pixel[0] - 30,
+            "mid-grey ({}) is too close to white ({})",
+            grey[0],
+            pixel[0]
+        );
+        assert!(grey[0] > 60, "mid-grey rendered too dark: {}", grey[0]);
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn masked_texels_are_cut_out_instead_of_blended() {
+        // Foliage cards rely on this: an almost transparent texel has to
+        // leave the background untouched and write no depth.
+        let Some(pixel) = render_textured_pixel([255, 255, 255, 25]) else {
+            panic!("no GPU adapter available");
+        };
+        assert_eq!(
+            pixel[..3],
+            [0, 0, 0],
+            "masked texel was drawn instead of discarded"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn shading_has_no_seam_at_the_camera_eye_level() {
+        // One flat, up-facing surface straddling the camera's altitude. Any
+        // view-dependent normal flip splits it exactly at eye level, which
+        // in a real map reads as a straight horizontal line across the
+        // screen with all the terrain beyond it darkened.
+        let Some((side, pixels)) = render_textured_frame([200, 200, 200, 255], [0.0, 0.0, 2.0])
+        else {
+            panic!("no GPU adapter available");
+        };
+
+        let sample = |row: u32| -> [u8; 3] {
+            let offset = ((row * side + side / 2) * 4) as usize;
+            [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
+        };
+        let above = sample(side / 4); // above eye level
+        let below = sample(side * 3 / 4); // below eye level
+
+        for channel in 0..3 {
+            let difference = above[channel].abs_diff(below[channel]);
+            assert!(
+                difference <= 4,
+                "channel {channel} differs by {difference} across the camera's eye level \
+                 ({} above vs {} below)",
+                above[channel],
+                below[channel]
+            );
+        }
+    }
     #[test]
     #[ignore = "requires GEODATA_EDITOR_CLIENT and GEODATA_EDITOR_L2J pointing to a local client"]
     fn boots_the_client_package_of_each_map_type() {
@@ -4429,11 +5675,148 @@ mod tests {
                 client_root: Some(PathBuf::from(&root)),
                 map_type: Some(map_type),
             };
-            let (source_map, packages) =
+            let (source_map, packages, pending) =
                 editor_source_map(&options).expect("load the client package");
             assert_eq!(source_map.name, map_type.package_name(&region));
             assert!(packages > 0);
+            assert_eq!(
+                pending, None,
+                "both flavours exist for this region, so nothing should be asked"
+            );
         }
+    }
+
+    #[test]
+    #[ignore = "requires GEODATA_EDITOR_CLIENT pointing to a local real Lineage II client"]
+    fn a_real_client_ships_regions_in_only_one_flavour() {
+        // Real clients are not symmetric: this is what makes the fallback
+        // necessary rather than defensive. Whichever side is missing, the
+        // other one has to be the offer.
+        let root = std::env::var("GEODATA_EDITOR_CLIENT").expect("set GEODATA_EDITOR_CLIENT");
+        let root = PathBuf::from(root);
+        let loader = PackageLoader::new(root.clone(), 0, false);
+
+        let mut regions: Vec<String> = std::fs::read_dir(root.join("Maps"))
+            .expect("read Maps")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_owned();
+                let stem = name.strip_suffix(".unr")?;
+                Some(stem.strip_suffix("_Classic").unwrap_or(stem).to_owned())
+            })
+            .collect();
+        regions.sort();
+        regions.dedup();
+
+        let mut only_classic = 0;
+        let mut only_normal = 0;
+        let mut offered: Option<String> = None;
+        for region in &regions {
+            match map_package_availability(&loader, region, MapType::Normal) {
+                PackageAvailability::OnlyOther(MapType::Classic, package) => {
+                    assert_eq!(package, format!("{region}_Classic"));
+                    only_classic += 1;
+                }
+                PackageAvailability::Selected(package) => assert_eq!(&package, region),
+                other => panic!("unexpected availability for {region}: {other:?}"),
+            }
+            match map_package_availability(&loader, region, MapType::Classic) {
+                PackageAvailability::OnlyOther(MapType::Normal, package) => {
+                    assert_eq!(&package, region);
+                    offered.get_or_insert(package);
+                    only_normal += 1;
+                }
+                PackageAvailability::Selected(package) => {
+                    assert_eq!(package, format!("{region}_Classic"))
+                }
+                other => panic!("unexpected availability for {region}: {other:?}"),
+            }
+        }
+        println!(
+            "{} regions: {only_classic} only classic, {only_normal} only normal",
+            regions.len()
+        );
+        assert!(
+            only_classic + only_normal > 0,
+            "expected at least one region shipped in a single flavour"
+        );
+
+        // Accepting the offer has to lead somewhere: the package that was
+        // proposed must parse, not merely exist on disk.
+        let offered = offered.expect("a region shipped only under the normal name");
+        let source_map = loader
+            .load_map(&offered)
+            .expect("the offered package must load");
+        assert_eq!(source_map.name, offered);
+    }
+
+    #[test]
+    fn a_missing_map_flavour_falls_back_to_the_one_the_client_ships() {
+        // A classic client names the region `25_25_Classic`, a normal one
+        // `25_25`. This client only ships the normal name.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("geodata-editor-flavour-{nonce}"));
+        std::fs::create_dir_all(root.join("Maps")).expect("create fake client");
+        std::fs::write(root.join("Maps").join("25_25.unr"), b"not a real package")
+            .expect("create fake package");
+        let loader = PackageLoader::new(root.clone(), 0, false);
+
+        assert_eq!(
+            map_package_availability(&loader, "25_25", MapType::Classic),
+            PackageAvailability::OnlyOther(MapType::Normal, "25_25".into()),
+            "the classic name is absent, so the normal one must be offered"
+        );
+        assert_eq!(
+            map_package_availability(&loader, "25_25", MapType::Normal),
+            PackageAvailability::Selected("25_25".into()),
+            "the selected flavour exists and must be used as is"
+        );
+        assert_eq!(
+            map_package_availability(&loader, "26_26", MapType::Classic),
+            PackageAvailability::Neither
+        );
+
+        // And the reverse direction, on a client that only ships classic.
+        std::fs::rename(
+            root.join("Maps").join("25_25.unr"),
+            root.join("Maps").join("30_30_Classic.unr"),
+        )
+        .expect("rename fake package");
+        assert_eq!(
+            map_package_availability(&loader, "30_30", MapType::Normal),
+            PackageAvailability::OnlyOther(MapType::Classic, "30_30_Classic".into())
+        );
+
+        // The prompt the UI shows carries both names and the flavour to
+        // switch to, so accepting it can load without asking again.
+        let pending = map_package_or_prompt(&loader, "30_30", MapType::Normal)
+            .expect_err("the normal name is absent")
+            .expect("the classic name exists, so a prompt is expected");
+        assert_eq!(pending.missing, "30_30");
+        assert_eq!(pending.available, "30_30_Classic");
+        assert_eq!(pending.available_type, MapType::Classic);
+        assert_eq!(
+            pending.question(),
+            "O mapa 30_30 não existe, mas o 30_30_Classic existe. Quer usar ele?"
+        );
+        assert_eq!(
+            map_package_or_prompt(&loader, "26_26", MapType::Classic).expect_err("absent"),
+            None,
+            "neither flavour exists, so there is nothing to offer"
+        );
+
+        // What the "Usar ..." button does: switch the map type, then reopen.
+        // The second pass must resolve straight to a package.
+        assert_eq!(
+            map_package_or_prompt(&loader, "30_30", pending.available_type),
+            Ok("30_30_Classic".into()),
+            "accepting the offer has to load instead of asking again"
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove fake client");
     }
 
     #[test]
@@ -4789,6 +6172,73 @@ mod tests {
     fn look_at_keeps_the_camera_origin_finite() {
         let matrix = look_at_rh([0.0, 10.0, 10.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
         assert!(matrix.into_iter().flatten().all(f32::is_finite));
+    }
+
+    #[test]
+    fn textured_vertices_share_the_collision_mesh_space() {
+        // A geodata region sits at absolute Lineage II coordinates, so the
+        // preview rebases every mesh onto `map_origin`. A textured batch
+        // left in absolute space renders tens of thousands of units away
+        // from the collision geometry and geodata cells it overlays.
+        let bounds = Box3::new(
+            Vec3::new(-98_304.0, -3_205.0, 131_072.0),
+            Vec3::new(-65_536.0, 1_773.0, 163_840.0),
+        );
+        let origin = map_origin(bounds);
+        let corner = Vec3::new(-98_304.0, -3_205.0, 131_072.0);
+        let batch = VisualBatch {
+            texture: None,
+            vertices: vec![(corner, Vec3::new(0.0, 1.0, 0.0), [0.25, 0.75])],
+            indices: vec![0],
+        };
+
+        let textured = textured_batch_vertices(&batch, origin);
+        let collision = source_collision_mesh(
+            &[Triangle {
+                a: corner,
+                b: corner,
+                c: corner,
+            }],
+            origin,
+            [1.0; 4],
+        );
+
+        assert_eq!(textured.len(), 1);
+        assert_eq!(textured[0].position, collision.vertices[0].position);
+        assert_eq!(textured[0].uv, [0.25, 0.75]);
+    }
+
+    #[test]
+    fn mip_downsampling_averages_in_linear_light() {
+        // A black/white checkerboard is half the light, and half the light
+        // is sRGB ~188, not the byte midpoint 128. Averaging the encoded
+        // bytes is what made distant tiled surfaces read as dark smears.
+        let checkerboard = [
+            0, 0, 0, 255, 255, 255, 255, 255, // row 0: black, white
+            255, 255, 255, 255, 0, 0, 0, 255, // row 1: white, black
+        ];
+
+        let (width, height, mip) = downsample_rgba(2, 2, &checkerboard);
+
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(mip[3], 255, "opaque texels must stay opaque");
+        for channel in 0..3 {
+            assert!(
+                (180..=190).contains(&mip[channel]),
+                "channel {channel} averaged to {} in gamma space, expected ~182 (50% linear)",
+                mip[channel]
+            );
+        }
+    }
+
+    #[test]
+    fn srgb_round_trip_preserves_every_channel_value() {
+        // The mip chain rides on this pair being each other's inverse; a
+        // drift here would tint every generated level.
+        for value in 0..=255_u8 {
+            let round_tripped = linear_to_srgb(SRGB_TO_LINEAR[value as usize]);
+            assert_eq!(round_tripped, value, "sRGB round trip drifted at {value}");
+        }
     }
 
     #[test]
