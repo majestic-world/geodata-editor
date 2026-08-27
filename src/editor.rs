@@ -63,6 +63,47 @@ impl MapType {
     }
 }
 
+/// Color scheme for the editor UI. Dark is the default and the theme the
+/// editor has always shipped with; light is opt-in via the toolbar toggle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EditorTheme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl EditorTheme {
+    /// Returns the other theme, used to implement a single toggle control.
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Escuro",
+            Self::Light => "Claro",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
+        }
+    }
+}
+
 /// Region shared by a geodata file and its Unreal package: `22_22` for
 /// `22_22.l2j`, `22_22.l2g`, and `22_22_conv.dat`.
 pub fn geodata_region(path: &Path) -> Option<String> {
@@ -81,6 +122,7 @@ pub struct EditorMemory {
     pub client_root: String,
     pub geodata_path: String,
     pub map_type: MapType,
+    pub theme: EditorTheme,
 }
 
 const MEMORY_FILE: &str = "editor-history.ini";
@@ -114,10 +156,11 @@ fn memory_path() -> PathBuf {
 
 fn format_memory(memory: &EditorMemory) -> String {
     format!(
-        "version=3\nclient_root={}\ngeodata_path={}\nmap_type={}\n",
+        "version=4\nclient_root={}\ngeodata_path={}\nmap_type={}\ntheme={}\n",
         escape(&memory.client_root),
         escape(&memory.geodata_path),
         memory.map_type.key(),
+        memory.theme.key(),
     )
 }
 
@@ -132,6 +175,7 @@ fn parse_memory(contents: &str) -> EditorMemory {
             "client_root" => memory.client_root = value,
             "geodata_path" => memory.geodata_path = value,
             "map_type" => memory.map_type = MapType::parse(&value).unwrap_or_default(),
+            "theme" => memory.theme = EditorTheme::parse(&value).unwrap_or_default(),
             _ => {}
         }
     }
@@ -277,12 +321,8 @@ mod tests {
 
     #[test]
     fn rejects_an_unknown_map_type() {
-        let error = parse([
-            "GeodataEditor".into(),
-            "--type".into(),
-            "chronicle".into(),
-        ])
-        .unwrap_err();
+        let error =
+            parse(["GeodataEditor".into(), "--type".into(), "chronicle".into()]).unwrap_err();
         assert!(error.to_string().contains("invalid map type"));
     }
 
@@ -321,6 +361,7 @@ mod tests {
             client_root: r"C:\Lineage II\Client".into(),
             geodata_path: r"D:\Geodata\22_22.l2j".into(),
             map_type: MapType::Normal,
+            theme: EditorTheme::Light,
         };
         assert_eq!(parse_memory(&format_memory(&memory)), memory);
     }

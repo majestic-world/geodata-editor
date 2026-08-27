@@ -20,7 +20,7 @@ use winit::{
 };
 
 use crate::{
-    editor::{self, EditorMemory, EditorOptions, MapType},
+    editor::{self, EditorMemory, EditorOptions, EditorTheme, MapType},
     error::{AppError, Result},
     geometry::{Box3, Triangle, Vec3},
     l2j::{self, Direction, Document, EditableBlockType, Layer, LayerAddress, NULL_HEIGHT},
@@ -179,7 +179,11 @@ struct Preview {
 }
 
 impl Preview {
-    async fn new(event_loop: &EventLoop<()>, source_map: SourceMap) -> Result<Self> {
+    async fn new(
+        event_loop: &EventLoop<()>,
+        source_map: SourceMap,
+        theme: EditorTheme,
+    ) -> Result<Self> {
         let window = Arc::new(
             WindowBuilder::new()
                 .with_title(WINDOW_TITLE)
@@ -246,7 +250,7 @@ impl Preview {
         };
         surface.configure(&device, &config);
         window.set_visible(true);
-        let _ = present_loading_screen(&window, &surface, &device, &queue, &config);
+        let _ = present_loading_screen(&window, &surface, &device, &queue, &config, theme);
 
         let origin = map_origin(source_map.bounds);
         let camera = Camera::for_bounds(source_map.bounds);
@@ -291,10 +295,7 @@ impl Preview {
         let collision_meshes = CollisionMeshes::new(&device, &source_map, origin);
 
         let egui_context = egui::Context::default();
-        let mut visuals = egui::Visuals::dark();
-        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 166, 181);
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0, 137, 151);
-        egui_context.set_visuals(visuals);
+        egui_context.set_visuals(egui::Visuals::dark());
         let egui_state = egui_winit::State::new(
             egui_context.clone(),
             egui::ViewportId::ROOT,
@@ -403,6 +404,7 @@ fn present_loading_screen(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
+    theme: EditorTheme,
 ) -> std::result::Result<(), wgpu::SurfaceError> {
     let output = surface.get_current_texture()?;
     let view = output
@@ -424,7 +426,7 @@ fn present_loading_screen(
     }
     let full_output = context.run(raw_input, |context| {
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(14, 19, 24)))
+            .frame(egui::Frame::none().fill(theme_extreme_bg(theme)))
             .show(context, |ui| {
                 ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                     ui.add_space(((ui.available_height() - 110.0) * 0.5).max(0.0));
@@ -432,19 +434,18 @@ fn present_loading_screen(
                         egui::RichText::new("GEODATA EDITOR")
                             .size(28.0)
                             .strong()
-                            .color(egui::Color32::from_rgb(42, 202, 219)),
+                            .color(theme_accent(theme)),
                     );
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new("Carregando editor...")
                             .size(15.0)
-                            .color(egui::Color32::from_rgb(190, 200, 210)),
+                            .color(theme_muted_color(theme)),
                     );
                     ui.add_space(18.0);
                     let (bar, _) =
                         ui.allocate_exact_size(egui::vec2(240.0, 3.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(bar, 0.0, egui::Color32::from_rgb(42, 202, 219));
+                    ui.painter().rect_filled(bar, 0.0, theme_accent(theme));
                 });
             });
     });
@@ -542,6 +543,7 @@ struct EditorUi {
     selection_hidden: bool,
     client_root: String,
     map_type: MapType,
+    theme: EditorTheme,
     selected: LayerAddress,
     selection: Vec<LayerAddress>,
     rectangle_start: Option<LayerAddress>,
@@ -763,8 +765,9 @@ impl EditorView {
         options: EditorOptions,
         memory: EditorMemory,
     ) -> Result<Self> {
-        let preview = Preview::new(event_loop, source_map).await?;
-        configure_editor_theme(&preview.egui_context);
+        let theme = memory.theme;
+        let preview = Preview::new(event_loop, source_map, theme).await?;
+        apply_editor_theme(&preview.egui_context, theme);
         let mut ui = EditorUi {
             open_path: options
                 .input
@@ -777,6 +780,7 @@ impl EditorView {
                 .map(|path| path.display().to_string())
                 .unwrap_or(memory.client_root),
             map_type: options.map_type.unwrap_or(memory.map_type),
+            theme,
             brush_width: 1,
             brush_height: 1,
             visual_stride: 1,
@@ -1104,15 +1108,18 @@ impl EditorView {
     }
 
     fn draw_editor_toolbar(&mut self, ui: &mut egui::Ui, action: &mut EditorAction) {
-        const ACCENT: egui::Color32 = egui::Color32::from_rgb(42, 202, 219);
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(7.0, 0.0);
             ui.add_sized(
                 [138.0, 24.0],
-                egui::Label::new(egui::RichText::new("GEODATA EDITOR").strong().color(ACCENT)),
+                egui::Label::new(
+                    egui::RichText::new("GEODATA EDITOR")
+                        .strong()
+                        .color(theme_accent(self.ui.theme)),
+                ),
             );
             ui.separator();
-            toolbar_section_label(ui, "PROJETO", ACCENT);
+            toolbar_section_label(ui, "PROJETO", theme_accent(self.ui.theme));
             if ui.button("Abrir projeto").clicked() {
                 *action = EditorAction::OpenProject;
             }
@@ -1123,7 +1130,7 @@ impl EditorView {
                 *action = EditorAction::Save;
             }
             ui.separator();
-            toolbar_section_label(ui, "EDIÇÃO", ACCENT);
+            toolbar_section_label(ui, "EDIÇÃO", theme_accent(self.ui.theme));
             if ui
                 .add_enabled(self.loaded, egui::Button::new("Desfazer"))
                 .clicked()
@@ -1137,10 +1144,21 @@ impl EditorView {
                 *action = EditorAction::Redo;
             }
             ui.separator();
-            toolbar_section_label(ui, "VISUALIZAÇÃO", ACCENT);
+            toolbar_section_label(ui, "VISUALIZAÇÃO", theme_accent(self.ui.theme));
             ui.checkbox(&mut self.preview.ui.wireframe, "Wireframe");
             ui.checkbox(&mut self.preview.ui.culling, "Culling");
             ui.checkbox(&mut self.ui.show_nswe_icons, "NSWE");
+            ui.separator();
+            toolbar_section_label(ui, "TEMA", theme_accent(self.ui.theme));
+            if ui.button(self.ui.theme.toggled().label()).clicked() {
+                self.ui.theme = self.ui.theme.toggled();
+                apply_editor_theme(ui.ctx(), self.ui.theme);
+                if let Err(error) = self.persist_memory() {
+                    self.ui
+                        .status
+                        .push_str(&format!(" Aviso: memória não salva: {error}"));
+                }
+            }
         });
     }
 
@@ -1150,7 +1168,6 @@ impl EditorView {
         action: &mut EditorAction,
         visual_changed: &mut bool,
     ) {
-        const ACCENT: egui::Color32 = egui::Color32::from_rgb(42, 202, 219);
         ui.add_space(4.0);
         ui.heading("Inspetor");
         ui.label(
@@ -1161,30 +1178,50 @@ impl EditorView {
             })
             .small()
             .color(if self.loaded && self.has_context {
-                egui::Color32::from_rgb(112, 204, 145)
+                theme_success_color(self.ui.theme)
             } else {
-                egui::Color32::from_rgb(180, 190, 200)
+                theme_muted_color(self.ui.theme)
             }),
         );
         ui.separator();
 
-        egui::CollapsingHeader::new(egui::RichText::new("Projeto").strong().color(ACCENT))
-            .default_open(!self.loaded)
-            .show(ui, |ui| self.draw_project_section(ui, action));
-        egui::CollapsingHeader::new(egui::RichText::new("Seleção").strong().color(ACCENT))
-            .default_open(true)
-            .show(ui, |ui| self.draw_selection_section(ui, visual_changed));
-        egui::CollapsingHeader::new(egui::RichText::new("Passabilidade").strong().color(ACCENT))
-            .default_open(true)
-            .show(ui, |ui| {
-                self.draw_passability_section(ui, action, visual_changed)
-            });
-        egui::CollapsingHeader::new(egui::RichText::new("Bloco").strong().color(ACCENT))
-            .default_open(false)
-            .show(ui, |ui| self.draw_block_section(ui, action));
-        egui::CollapsingHeader::new(egui::RichText::new("Visualização").strong().color(ACCENT))
-            .default_open(false)
-            .show(ui, |ui| self.draw_visualization_section(ui, visual_changed));
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Projeto")
+                .strong()
+                .color(theme_accent(self.ui.theme)),
+        )
+        .default_open(!self.loaded)
+        .show(ui, |ui| self.draw_project_section(ui, action));
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Seleção")
+                .strong()
+                .color(theme_accent(self.ui.theme)),
+        )
+        .default_open(true)
+        .show(ui, |ui| self.draw_selection_section(ui, visual_changed));
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Passabilidade")
+                .strong()
+                .color(theme_accent(self.ui.theme)),
+        )
+        .default_open(true)
+        .show(ui, |ui| {
+            self.draw_passability_section(ui, action, visual_changed)
+        });
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Bloco")
+                .strong()
+                .color(theme_accent(self.ui.theme)),
+        )
+        .default_open(false)
+        .show(ui, |ui| self.draw_block_section(ui, action));
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Visualização")
+                .strong()
+                .color(theme_accent(self.ui.theme)),
+        )
+        .default_open(false)
+        .show(ui, |ui| self.draw_visualization_section(ui, visual_changed));
     }
 
     fn draw_project_section(&mut self, ui: &mut egui::Ui, action: &mut EditorAction) {
@@ -1230,9 +1267,7 @@ impl EditorView {
                 ui.small(format!("Mapa do cliente: Maps/{package}.unr"));
             }
             None => {
-                ui.small(
-                    egui::RichText::new("O mapa do cliente vem do nome da geodata.").weak(),
-                );
+                ui.small(egui::RichText::new("O mapa do cliente vem do nome da geodata.").weak());
             }
         }
         ui.add_space(6.0);
@@ -1359,7 +1394,7 @@ impl EditorView {
         let selection_count = editor_active_selection_count(&self.ui);
         ui.label(
             egui::RichText::new(format!("{} célula(s) ativa(s)", selection_count))
-                .color(egui::Color32::from_rgb(42, 202, 219)),
+                .color(theme_accent(self.ui.theme)),
         );
     }
 
@@ -1411,7 +1446,7 @@ impl EditorView {
         self.sync_height_input();
         let Some(layer) = self.document.cell(self.ui.selected) else {
             ui.colored_label(
-                egui::Color32::from_rgb(255, 145, 120),
+                theme_error_color(self.ui.theme),
                 "A camada visível não existe nesta coluna.",
             );
             return;
@@ -1634,7 +1669,7 @@ impl EditorView {
         } else {
             &self.ui.status
         };
-        let status_color = editor_status_color(status);
+        let status_color = editor_status_color(status, self.ui.theme);
         ui.add_sized(
             [ui.available_width(), 42.0],
             egui::Label::new(egui::RichText::new(status).color(status_color)).wrap(true),
@@ -1960,6 +1995,7 @@ impl EditorView {
             client_root: self.ui.client_root.trim().to_owned(),
             geodata_path: self.ui.open_path.trim().to_owned(),
             map_type: self.ui.map_type,
+            theme: self.ui.theme,
         })
     }
 
@@ -2468,19 +2504,80 @@ fn reconstruct_route(
     (!route.is_empty()).then_some(route)
 }
 
-fn configure_editor_theme(context: &egui::Context) {
+/// Darkest/lightest background tone in the palette, reserved for recessed
+/// surfaces such as the loading screen and text-edit backgrounds. Values are
+/// kept neutral gray (no color tint) and mid-toned: enough contrast to read
+/// as its theme without collapsing into a near-black or glaring-white
+/// background.
+fn theme_extreme_bg(theme: EditorTheme) -> egui::Color32 {
+    match theme {
+        EditorTheme::Dark => egui::Color32::from_gray(30),
+        EditorTheme::Light => egui::Color32::from_gray(250),
+    }
+}
+
+/// Neutral gray accent for headings, active highlights, and the loading
+/// screen. Carries no hue of its own; hierarchy comes from contrasting with
+/// body text, not from color.
+fn theme_accent(theme: EditorTheme) -> egui::Color32 {
+    match theme {
+        EditorTheme::Dark => egui::Color32::from_gray(224),
+        EditorTheme::Light => egui::Color32::from_gray(40),
+    }
+}
+
+/// Muted secondary text: loading subtitle, "waiting for project" status.
+fn theme_muted_color(theme: EditorTheme) -> egui::Color32 {
+    match theme {
+        EditorTheme::Dark => egui::Color32::from_rgb(190, 200, 210),
+        EditorTheme::Light => egui::Color32::from_rgb(95, 100, 108),
+    }
+}
+
+/// Success text: "project open", saved/loaded status messages.
+fn theme_success_color(theme: EditorTheme) -> egui::Color32 {
+    match theme {
+        EditorTheme::Dark => egui::Color32::from_rgb(112, 204, 145),
+        EditorTheme::Light => egui::Color32::from_rgb(24, 128, 68),
+    }
+}
+
+/// Error/warning text: failed operations, rejected input, missing layers.
+fn theme_error_color(theme: EditorTheme) -> egui::Color32 {
+    match theme {
+        EditorTheme::Dark => egui::Color32::from_rgb(255, 145, 120),
+        EditorTheme::Light => egui::Color32::from_rgb(190, 55, 35),
+    }
+}
+
+fn apply_editor_theme(context: &egui::Context, theme: EditorTheme) {
     let mut style = (*context.style()).clone();
-    style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = egui::Color32::from_rgb(21, 27, 34);
-    style.visuals.window_fill = egui::Color32::from_rgb(25, 32, 40);
-    style.visuals.faint_bg_color = egui::Color32::from_rgb(31, 40, 49);
-    style.visuals.extreme_bg_color = egui::Color32::from_rgb(14, 19, 24);
-    style.visuals.selection.bg_fill = egui::Color32::from_rgb(20, 125, 143);
+    style.visuals = match theme {
+        EditorTheme::Dark => egui::Visuals::dark(),
+        EditorTheme::Light => egui::Visuals::light(),
+    };
+    let (panel, window, faint, selection_bg, selection_stroke, inactive, hovered, active) =
+        match theme {
+            EditorTheme::Dark => (42, 48, 56, 92, 210, 60, 78, 104),
+            EditorTheme::Light => (244, 250, 236, 206, 90, 228, 214, 198),
+        };
+    style.visuals.panel_fill = egui::Color32::from_gray(panel);
+    style.visuals.window_fill = egui::Color32::from_gray(window);
+    style.visuals.faint_bg_color = egui::Color32::from_gray(faint);
+    style.visuals.extreme_bg_color = theme_extreme_bg(theme);
+    style.visuals.selection.bg_fill = egui::Color32::from_gray(selection_bg);
     style.visuals.selection.stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(94, 226, 237));
-    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(38, 48, 58);
-    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(41, 92, 102);
-    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(24, 138, 153);
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(selection_stroke));
+    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(inactive);
+    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(hovered);
+    style.visuals.widgets.active.bg_fill = egui::Color32::from_gray(active);
+    // The default dark `noninteractive.fg_stroke` (used for every plain
+    // label and heading with no explicit color) is gray(140), which reads
+    // as too close to the mid-gray panel background. Light theme keeps its
+    // own default (already dark-on-light, legible) untouched.
+    if theme == EditorTheme::Dark {
+        style.visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_gray(235);
+    }
     style.spacing.item_spacing = egui::vec2(7.0, 6.0);
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
     context.set_style(style);
@@ -2496,17 +2593,17 @@ fn toolbar_section_label(ui: &mut egui::Ui, text: &str, accent: egui::Color32) {
     );
 }
 
-fn editor_status_color(status: &str) -> egui::Color32 {
+fn editor_status_color(status: &str, theme: EditorTheme) -> egui::Color32 {
     if status.starts_with("Falha") || status.contains("recusada") || status.contains("inválid") {
-        egui::Color32::from_rgb(255, 145, 120)
+        theme_error_color(theme)
     } else if status.starts_with("Salvo")
         || status.starts_with("Projeto carregado")
         || status.starts_with("NSWE alterado")
         || status.starts_with("NSWE liberado")
     {
-        egui::Color32::from_rgb(112, 204, 145)
+        theme_success_color(theme)
     } else {
-        egui::Color32::from_rgb(190, 202, 212)
+        theme_muted_color(theme)
     }
 }
 
