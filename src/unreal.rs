@@ -338,10 +338,16 @@ impl PackageLoader {
 
 fn decrypt(path: &Path) -> Result<Vec<u8>> {
     let bytes = fs::read(path)?;
+    // Unencrypted clients ship the raw Unreal package. Only the Lineage2Ver
+    // container carries the XOR pass that has to be undone here.
+    if bytes.starts_with(&PACKAGE_MAGIC.to_le_bytes()) {
+        return Ok(bytes);
+    }
     const HEADER: &[u8] = b"L\x00i\x00n\x00e\x00a\x00g\x00e\x002\x00V\x00e\x00r\x00";
     if bytes.len() < 28 || &bytes[..22] != HEADER {
-        return Err(AppError::InvalidData(format!(
-            "can't detect Lineage 2 encryption version: {}",
+        return Err(AppError::Unsupported(format!(
+            "package is neither a raw Unreal package nor a Lineage2Ver container (signature {}): {}",
+            signature(&bytes),
             path.display()
         )));
     }
@@ -371,6 +377,22 @@ fn decrypt(path: &Path) -> Result<Vec<u8>> {
         }
     };
     Ok(bytes[28..].iter().map(|byte| byte ^ key).collect())
+}
+
+/// Printable form of a package's leading bytes, used to name an unsupported
+/// container in an error a user can act on (`PHXDAT01`, for instance).
+fn signature(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(8)
+        .map(|byte| {
+            if byte.is_ascii_graphic() {
+                (*byte as char).to_string()
+            } else {
+                format!("\\x{byte:02x}")
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1867,6 +1889,23 @@ mod tests {
         let path = std::env::temp_dir().join("geodata-editor-v111.unr");
         fs::write(&path, encrypted).unwrap();
         assert_eq!(decrypt(&path).unwrap(), b"ab");
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn reads_an_unencrypted_package_verbatim() {
+        let mut raw = PACKAGE_MAGIC.to_le_bytes().to_vec();
+        raw.extend([0x7b, 0x00, 0x1c, 0x00]);
+        let path = std::env::temp_dir().join("geodata-editor-raw.unr");
+        fs::write(&path, &raw).unwrap();
+        assert_eq!(decrypt(&path).unwrap(), raw);
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn names_the_container_of_an_unsupported_package() {
+        let path = std::env::temp_dir().join("geodata-editor-packed.unr");
+        fs::write(&path, b"PHXDAT01\x01\x00\x40\x00").unwrap();
+        let error = decrypt(&path).unwrap_err().to_string();
+        assert!(error.contains("PHXDAT01"), "{error}");
         let _ = fs::remove_file(path);
     }
 }

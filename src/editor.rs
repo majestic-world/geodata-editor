@@ -1,6 +1,11 @@
 //! Command line entry point and configuration for the standalone editor.
 
-use std::{env, ffi::OsString, fs, path::PathBuf};
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     editor_view,
@@ -11,7 +16,62 @@ use crate::{
 pub struct EditorOptions {
     pub input: Option<PathBuf>,
     pub client_root: Option<PathBuf>,
-    pub map: Option<String>,
+    pub map_type: Option<MapType>,
+}
+
+/// Map flavour of the Lineage II client. It decides which Unreal package under
+/// `<client>/Maps` backs a geodata region: `22_22.unr` for normal clients and
+/// `22_22_Classic.unr` for classic ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MapType {
+    #[default]
+    Classic,
+    Normal,
+}
+
+impl MapType {
+    pub const ALL: [Self; 2] = [Self::Classic, Self::Normal];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::Normal => "Normal",
+        }
+    }
+
+    /// Unreal package name for a geodata region, for example `22_22_Classic`.
+    pub fn package_name(self, region: &str) -> String {
+        match self {
+            Self::Classic => format!("{region}_Classic"),
+            Self::Normal => region.to_owned(),
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Normal => "normal",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "classic" => Some(Self::Classic),
+            "normal" => Some(Self::Normal),
+            _ => None,
+        }
+    }
+}
+
+/// Region shared by a geodata file and its Unreal package: `22_22` for
+/// `22_22.l2j`, `22_22.l2g`, and `22_22_conv.dat`.
+pub fn geodata_region(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let region = match name.to_ascii_lowercase().strip_suffix("_conv.dat") {
+        Some(prefix) => &name[..prefix.len()],
+        None => path.file_stem()?.to_str()?,
+    };
+    (!region.is_empty()).then(|| region.to_owned())
 }
 
 /// Values restored into the editor welcome screen. They are stored only in the
@@ -20,10 +80,12 @@ pub struct EditorOptions {
 pub struct EditorMemory {
     pub client_root: String,
     pub geodata_path: String,
-    pub map_name: String,
+    pub map_type: MapType,
 }
 
 const MEMORY_FILE: &str = "editor-history.ini";
+
+const USAGE: &str = "GeodataEditor [--input <arquivo.l2j|arquivo.l2g|mapa_conv.dat>] [--client-root <cliente>] [--type classic|normal]";
 
 pub fn load_memory() -> EditorMemory {
     let Ok(contents) = fs::read_to_string(memory_path()) else {
@@ -52,10 +114,10 @@ fn memory_path() -> PathBuf {
 
 fn format_memory(memory: &EditorMemory) -> String {
     format!(
-        "version=2\nclient_root={}\ngeodata_path={}\nmap_name={}\n",
+        "version=3\nclient_root={}\ngeodata_path={}\nmap_type={}\n",
         escape(&memory.client_root),
         escape(&memory.geodata_path),
-        escape(&memory.map_name),
+        memory.map_type.key(),
     )
 }
 
@@ -69,7 +131,7 @@ fn parse_memory(contents: &str) -> EditorMemory {
         match key {
             "client_root" => memory.client_root = value,
             "geodata_path" => memory.geodata_path = value,
-            "map_name" => memory.map_name = value,
+            "map_type" => memory.map_type = MapType::parse(&value).unwrap_or_default(),
             _ => {}
         }
     }
@@ -114,9 +176,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
         .skip(1)
         .any(|value| value == "--help" || value == "-h")
     {
-        println!(
-            "GeodataEditor [--input <arquivo.l2j|arquivo.l2g|mapa_conv.dat>] [--client-root <cliente> --map <mapa>]"
-        );
+        println!("{USAGE}");
         return Ok(());
     }
     let options = parse(arguments)?;
@@ -140,9 +200,7 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<EditorOpti
         .iter()
         .any(|value| value == "--help" || value == "-h")
     {
-        println!(
-            "GeodataEditor [--input <arquivo.l2j|arquivo.l2g|mapa_conv.dat>] [--client-root <cliente> --map <mapa>]"
-        );
+        println!("{USAGE}");
         return Err(AppError::InvalidArgument(String::new()));
     }
     let mut options = EditorOptions::default();
@@ -159,7 +217,14 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<EditorOpti
         match option.as_str() {
             "--input" => options.input = Some(PathBuf::from(next("--input")?)),
             "--client-root" => options.client_root = Some(PathBuf::from(next("--client-root")?)),
-            "--map" => options.map = Some(next("--map")?),
+            "--type" => {
+                let value = next("--type")?;
+                options.map_type = Some(MapType::parse(&value).ok_or_else(|| {
+                    AppError::InvalidArgument(format!(
+                        "invalid map type: {value}; expected classic or normal"
+                    ))
+                })?);
+            }
             unknown => {
                 return Err(AppError::InvalidArgument(format!(
                     "unknown option: {unknown}"
@@ -168,14 +233,9 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<EditorOpti
         }
         index += 1;
     }
-    if options.client_root.is_some() != options.map.is_some() {
-        return Err(AppError::InvalidArgument(
-            "--client-root and --map must be used together".into(),
-        ));
-    }
     if options.input.is_some() && options.client_root.is_none() {
         return Err(AppError::InvalidArgument(
-            "GeodataEditor requires --client-root and --map when --input is provided".into(),
+            "GeodataEditor requires --client-root when --input is provided".into(),
         ));
     }
     if let Some(root) = &options.client_root {
@@ -202,23 +262,57 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<EditorOpti
 mod tests {
     use super::*;
     #[test]
-    fn parses_client_map_context() {
+    fn parses_client_context_with_a_map_type() {
         let options = parse([
             "GeodataEditor".into(),
             "--client-root".into(),
             ".".into(),
-            "--map".into(),
-            "22_22".into(),
+            "--type".into(),
+            "Normal".into(),
         ])
         .unwrap();
         assert_eq!(options.input, None);
-        assert_eq!(options.map.as_deref(), Some("22_22"));
+        assert_eq!(options.map_type, Some(MapType::Normal));
     }
 
     #[test]
-    fn rejects_an_l2j_without_client_map_context() {
+    fn rejects_an_unknown_map_type() {
+        let error = parse([
+            "GeodataEditor".into(),
+            "--type".into(),
+            "chronicle".into(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid map type"));
+    }
+
+    #[test]
+    fn rejects_an_l2j_without_a_client_root() {
         let error = parse(["GeodataEditor".into(), "--input".into(), "x.l2j".into()]).unwrap_err();
         assert!(error.to_string().contains("--client-root"));
+    }
+
+    #[test]
+    fn reads_the_region_of_every_geodata_extension() {
+        assert_eq!(
+            geodata_region(Path::new(r"D:\Geodata\22_22.l2j")).as_deref(),
+            Some("22_22")
+        );
+        assert_eq!(
+            geodata_region(Path::new("22_22.l2g")).as_deref(),
+            Some("22_22")
+        );
+        assert_eq!(
+            geodata_region(Path::new("22_22_conv.dat")).as_deref(),
+            Some("22_22")
+        );
+        assert_eq!(geodata_region(Path::new("_conv.dat")), None);
+    }
+
+    #[test]
+    fn names_the_unreal_package_of_each_map_type() {
+        assert_eq!(MapType::Classic.package_name("22_22"), "22_22_Classic");
+        assert_eq!(MapType::Normal.package_name("22_22"), "22_22");
     }
 
     #[test]
@@ -226,7 +320,7 @@ mod tests {
         let memory = EditorMemory {
             client_root: r"C:\Lineage II\Client".into(),
             geodata_path: r"D:\Geodata\22_22.l2j".into(),
-            map_name: "22_22_Classic".into(),
+            map_type: MapType::Normal,
         };
         assert_eq!(parse_memory(&format_memory(&memory)), memory);
     }

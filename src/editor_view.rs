@@ -20,7 +20,7 @@ use winit::{
 };
 
 use crate::{
-    editor::{self, EditorMemory, EditorOptions},
+    editor::{self, EditorMemory, EditorOptions, MapType},
     error::{AppError, Result},
     geometry::{Box3, Triangle, Vec3},
     l2j::{self, Direction, Document, EditableBlockType, Layer, LayerAddress, NULL_HEIGHT},
@@ -109,9 +109,13 @@ fn escape_pressed(event: &WindowEvent) -> bool {
 }
 
 fn editor_source_map(options: &EditorOptions) -> Result<(SourceMap, usize)> {
-    if let (Some(root), Some(map)) = (&options.client_root, &options.map) {
+    if let (Some(root), Some(input)) = (&options.client_root, &options.input) {
+        let region = editor::geodata_region(input).ok_or_else(|| {
+            AppError::InvalidArgument(format!("invalid geodata name: {}", input.display()))
+        })?;
+        let package = options.map_type.unwrap_or_default().package_name(&region);
         let loader = PackageLoader::new(root.clone(), 0, false);
-        let source = loader.load_map(map)?;
+        let source = loader.load_map(&package)?;
         let count = loader.loaded_package_count();
         return Ok((source, count));
     }
@@ -120,7 +124,7 @@ fn editor_source_map(options: &EditorOptions) -> Result<(SourceMap, usize)> {
         .as_ref()
         .and_then(|path| path.file_stem())
         .and_then(|name| name.to_str())
-        .unwrap_or("Selecione cliente, mapa e geodata")
+        .unwrap_or("Selecione o cliente e a geodata")
         .to_owned();
     Ok((
         SourceMap {
@@ -537,7 +541,7 @@ struct EditorUi {
     open_path: String,
     selection_hidden: bool,
     client_root: String,
-    map_name: String,
+    map_type: MapType,
     selected: LayerAddress,
     selection: Vec<LayerAddress>,
     rectangle_start: Option<LayerAddress>,
@@ -772,7 +776,7 @@ impl EditorView {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or(memory.client_root),
-            map_name: options.map.clone().unwrap_or(memory.map_name),
+            map_type: options.map_type.unwrap_or(memory.map_type),
             brush_width: 1,
             brush_height: 1,
             visual_stride: 1,
@@ -783,7 +787,7 @@ impl EditorView {
         if loaded {
             ui.status = "Projeto carregado com o contexto de colisão do cliente.".into();
         } else {
-            ui.status = "Informe cliente, mapa e geodata para carregar o projeto.".into();
+            ui.status = "Informe o cliente e a geodata para carregar o projeto.".into();
         }
         let max_layer_count = document.max_layer_count().max(1);
         let origin = map_origin(preview.source_map.bounds);
@@ -816,7 +820,7 @@ impl EditorView {
             preview,
             document,
             loaded,
-            has_context: options.client_root.is_some(),
+            has_context: loaded,
             package_count,
             max_layer_count,
             ui,
@@ -1189,7 +1193,7 @@ impl EditorView {
             if ui.button("Escolher pasta...").clicked() {
                 if let Some(path) = pick_client_directory(&self.ui.client_root) {
                     self.ui.client_root = path.display().to_string();
-                    self.ui.status = "Cliente selecionado. Escolha o mapa e a geodata.".into();
+                    self.ui.status = "Cliente selecionado. Escolha o tipo e a geodata.".into();
                 }
             }
         });
@@ -1200,30 +1204,15 @@ impl EditorView {
         );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label("Mapa");
-            let choose_map = ui
-                .add_enabled(
-                    !self.ui.client_root.trim().is_empty(),
-                    egui::Button::new("Escolher mapa..."),
-                )
-                .clicked();
-            if choose_map {
-                if let Some(path) = pick_map_file(&self.ui.client_root) {
-                    match path.file_stem().and_then(|name| name.to_str()) {
-                        Some(name) => {
-                            self.ui.map_name = name.to_owned();
-                            self.ui.status = format!("Mapa selecionado: {name}.");
-                        }
-                        None => self.ui.status = "O nome do arquivo de mapa não é válido.".into(),
+            ui.label("Tipo");
+            egui::ComboBox::from_id_source("editor_map_type")
+                .selected_text(self.ui.map_type.label())
+                .show_ui(ui, |ui| {
+                    for map_type in MapType::ALL {
+                        ui.selectable_value(&mut self.ui.map_type, map_type, map_type.label());
                     }
-                }
-            }
+                });
         });
-        selected_path_label(
-            ui,
-            &self.ui.map_name,
-            "Selecione a pasta do cliente primeiro.",
-        );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Geodata");
@@ -1235,6 +1224,17 @@ impl EditorView {
             }
         });
         selected_path_label(ui, &self.ui.open_path, "Nenhuma geodata selecionada.");
+        ui.add_space(4.0);
+        match self.map_package() {
+            Some(package) => {
+                ui.small(format!("Mapa do cliente: Maps/{package}.unr"));
+            }
+            None => {
+                ui.small(
+                    egui::RichText::new("O mapa do cliente vem do nome da geodata.").weak(),
+                );
+            }
+        }
         ui.add_space(6.0);
         if ui.button("Carregar projeto").clicked() {
             *action = EditorAction::OpenProject;
@@ -1647,7 +1647,7 @@ impl EditorView {
         if !matches!(action, EditorAction::None | EditorAction::OpenProject)
             && (!self.loaded || !self.has_context)
         {
-            self.ui.status = "Carregue cliente, mapa e geodata antes de editar.".into();
+            self.ui.status = "Carregue o cliente e a geodata antes de editar.".into();
             return;
         }
         if self.ui.selection_hidden
@@ -1841,6 +1841,12 @@ impl EditorView {
         }
     }
 
+    /// Unreal package that backs the selected geodata for the current map type.
+    fn map_package(&self) -> Option<String> {
+        editor::geodata_region(Path::new(self.ui.open_path.trim()))
+            .map(|region| self.ui.map_type.package_name(&region))
+    }
+
     fn open_project(&mut self) {
         let client_text = self.ui.client_root.trim();
         if client_text.is_empty() {
@@ -1852,16 +1858,16 @@ impl EditorView {
             self.ui.status = format!("Pasta de cliente inválida: {}", client_root.display());
             return;
         }
-        let map = self.ui.map_name.trim();
-        if map.is_empty() {
-            self.ui.status = "Informe o nome do mapa, por exemplo 22_22_Classic.".into();
-            return;
-        }
-        let path = PathBuf::from(self.ui.open_path.trim());
-        if self.ui.open_path.trim().is_empty() {
+        let geodata_text = self.ui.open_path.trim();
+        if geodata_text.is_empty() {
             self.ui.status = "Selecione a geodata que será editada.".into();
             return;
         }
+        let path = PathBuf::from(geodata_text);
+        let Some(package) = self.map_package() else {
+            self.ui.status = format!("Nome de geodata inválido: {}", path.display());
+            return;
+        };
         let document = match Document::open(&path) {
             Ok(document) => document,
             Err(error) => {
@@ -1870,10 +1876,10 @@ impl EditorView {
             }
         };
         let loader = PackageLoader::new(client_root, 0, false);
-        let source_map = match loader.load_map(map) {
+        let source_map = match loader.load_map(&package) {
             Ok(source_map) => source_map,
             Err(error) => {
-                self.ui.status = format!("Falha ao carregar o mapa do cliente: {error}");
+                self.ui.status = format!("Falha ao carregar Maps/{package}.unr: {error}");
                 return;
             }
         };
@@ -1953,7 +1959,7 @@ impl EditorView {
         editor::save_memory(&EditorMemory {
             client_root: self.ui.client_root.trim().to_owned(),
             geodata_path: self.ui.open_path.trim().to_owned(),
-            map_name: self.ui.map_name.trim().to_owned(),
+            map_type: self.ui.map_type,
         })
     }
 
@@ -2630,19 +2636,6 @@ fn pick_client_directory(current: &str) -> Option<PathBuf> {
         dialog = dialog.set_directory(directory);
     }
     dialog.pick_folder()
-}
-
-fn pick_map_file(client_root: &str) -> Option<PathBuf> {
-    let mut dialog = FileDialog::new()
-        .set_title("Selecionar mapa Lineage II")
-        .add_filter("Mapas Unreal", &["unr"]);
-    let maps_directory = PathBuf::from(client_root.trim()).join("Maps");
-    if maps_directory.is_dir() {
-        dialog = dialog.set_directory(maps_directory);
-    } else if let Some(directory) = dialog_directory(client_root) {
-        dialog = dialog.set_directory(directory);
-    }
-    dialog.pick_file()
 }
 
 fn pick_geodata_file(current: &str) -> Option<PathBuf> {
@@ -4326,6 +4319,25 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GEODATA_EDITOR_CLIENT and GEODATA_EDITOR_L2J pointing to a local client"]
+    fn boots_the_client_package_of_each_map_type() {
+        let root = std::env::var("GEODATA_EDITOR_CLIENT").expect("set GEODATA_EDITOR_CLIENT");
+        let input = std::env::var("GEODATA_EDITOR_L2J").expect("set GEODATA_EDITOR_L2J");
+        let region = editor::geodata_region(Path::new(&input)).expect("region of the geodata");
+        for map_type in MapType::ALL {
+            let options = EditorOptions {
+                input: Some(PathBuf::from(&input)),
+                client_root: Some(PathBuf::from(&root)),
+                map_type: Some(map_type),
+            };
+            let (source_map, packages) =
+                editor_source_map(&options).expect("load the client package");
+            assert_eq!(source_map.name, map_type.package_name(&region));
+            assert!(packages > 0);
+        }
+    }
 
     #[test]
     fn editor_cells_and_selection_use_high_visibility_colours() {
