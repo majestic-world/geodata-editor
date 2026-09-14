@@ -39,6 +39,13 @@ remains visible until the replacement is ready. `src/editor_view/overlays.rs`
 owns the 16×16-block chunk cache: local changes reuse unaffected buffers, global
 filters regenerate all chunks, and hidden NSWE glyphs are rebuilt lazily.
 
+Visual batches preserve material blend/depth state, authored alpha cutoffs and
+separate opacity inputs. Opaque/masked geometry is drawn before transparent
+surfaces, which retain per-surface batches for back-to-front sorting. Encountered
+pipeline variants and shared bitmap uploads are prepared on the same worker.
+BSP visual visibility is independent of collision passability; invisible faces
+and zone/sky portals are not rendered as ordinary textured polygons.
+
 The camera projection and picking share the same viewport rectangle, excluding
 the menus, inspector and status bar. Unit tests cover the coordinate mapping at
 100%, 125% and 200% scale and a surface smaller than its panels.

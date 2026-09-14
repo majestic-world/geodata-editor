@@ -27,7 +27,7 @@ use crate::{
     error::{AppError, Result},
     geometry::{Box3, Triangle, Vec3},
     l2j::{self, Direction, Document, EditableBlockType, Layer, LayerAddress, NULL_HEIGHT},
-    unreal::{PackageLoader, SourceMap, VisualBatch},
+    unreal::{PackageLoader, SourceMap, VisualBatch, VisualBlend, VisualMaterialState},
 };
 
 mod loading;
@@ -236,7 +236,7 @@ struct Preview {
     geodata_overlay_pipeline: wgpu::RenderPipeline,
     nswe_icon_pipeline: wgpu::RenderPipeline,
     nswe_icon_bind_group: wgpu::BindGroup,
-    textured_pipeline: wgpu::RenderPipeline,
+    textured_pipelines: Arc<TexturedPipelineResources>,
     material_texture_layout: Arc<wgpu::BindGroupLayout>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -335,19 +335,7 @@ impl Preview {
             )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("editor-camera-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let camera_layout = create_camera_layout(&device);
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("editor-camera-bind-group"),
             layout: &camera_layout,
@@ -365,8 +353,12 @@ impl Preview {
         let (nswe_icon_pipeline, nswe_icon_bind_group) =
             create_nswe_icon_resources(&device, &queue, &camera_layout, format);
         let material_texture_layout = create_material_texture_layout(&device);
-        let textured_pipeline =
-            create_textured_pipeline(&device, &camera_layout, &material_texture_layout, format);
+        let textured_pipelines = Arc::new(TexturedPipelineResources::new(
+            &device,
+            &camera_layout,
+            &material_texture_layout,
+            format,
+        ));
         let depth_view = create_depth_view(&device, &config);
         let msaa_view = create_msaa_view(&device, &config);
         let collision_meshes = CollisionMeshes::new(&device, &source_map, origin);
@@ -399,7 +391,7 @@ impl Preview {
             geodata_overlay_pipeline,
             nswe_icon_pipeline,
             nswe_icon_bind_group,
-            textured_pipeline,
+            textured_pipelines,
             material_texture_layout: Arc::new(material_texture_layout),
             camera_buffer,
             camera_bind_group,
@@ -1069,6 +1061,11 @@ impl EditorView {
             &paint_jobs,
             &screen,
         );
+        if self.ui.textured_view {
+            if let Some(scene) = &mut self.textured_scene {
+                scene.sort_blended(self.preview.camera.forward());
+            }
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("editor-render-pass"),
@@ -1104,11 +1101,7 @@ impl EditorView {
             if self.has_context {
                 match (self.ui.textured_view, &self.textured_scene) {
                     (true, Some(scene)) => {
-                        scene.draw(
-                            &mut pass,
-                            &self.preview.textured_pipeline,
-                            &self.preview.camera_bind_group,
-                        );
+                        scene.draw(&mut pass, &self.preview.camera_bind_group);
                     }
                     _ => self.preview.draw_collision_meshes(&mut pass, false),
                 }
@@ -3536,31 +3529,55 @@ impl TexturedVertex {
     }
 }
 
-/// One draw call of the textured visualization: every triangle sharing the
-/// same material texture, already uploaded to the GPU.
+/// One independently sortable surface or merged opaque material group.
 struct TexturedBatch {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
-    material: wgpu::BindGroup,
+    material: Arc<wgpu::BindGroup>,
+    pipeline: usize,
+    center: [f32; 3],
 }
 
 /// GPU-resident form of `unreal::VisualScene`, built once when the textured
 /// view is enabled (or a new project loads while it's already enabled).
 struct TexturedScene {
     batches: Vec<TexturedBatch>,
+    pipelines: Vec<wgpu::RenderPipeline>,
+    opaque_order: Vec<usize>,
+    blended_order: Vec<(usize, f32)>,
+    sort_direction: Option<[f32; 3]>,
 }
 
 impl TexturedScene {
-    fn draw<'a>(
-        &'a self,
-        pass: &mut wgpu::RenderPass<'a>,
-        pipeline: &'a wgpu::RenderPipeline,
-        camera: &'a wgpu::BindGroup,
-    ) {
-        pass.set_pipeline(pipeline);
+    fn sort_blended(&mut self, forward: [f32; 3]) {
+        if self.sort_direction == Some(forward) {
+            return;
+        }
+        self.sort_direction = Some(forward);
+        for (index, depth) in &mut self.blended_order {
+            // Camera translation subtracts the same value from every depth,
+            // so only a changed viewing direction can change this ordering.
+            *depth = dot(self.batches[*index].center, forward);
+        }
+        self.blended_order
+            .sort_unstable_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+    }
+
+    fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup) {
         pass.set_bind_group(0, camera, &[]);
-        for batch in &self.batches {
+        let mut active_pipeline = None;
+        for index in self
+            .opaque_order
+            .iter()
+            .copied()
+            .chain(self.blended_order.iter().map(|(index, _)| *index))
+        {
+            let batch = &self.batches[index];
+            if active_pipeline != Some(batch.pipeline) {
+                pass.set_pipeline(&self.pipelines[batch.pipeline]);
+                active_pipeline = Some(batch.pipeline);
+            }
             pass.set_bind_group(1, &batch.material, &[]);
             pass.set_vertex_buffer(0, batch.vertices.slice(..));
             pass.set_index_buffer(batch.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -3663,6 +3680,22 @@ impl CameraUniform {
             _padding: 0.0,
         }
     }
+}
+
+fn create_camera_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("editor-camera-layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
 }
 
 struct Camera {
@@ -4245,6 +4278,26 @@ fn create_material_texture_layout(device: &wgpu::Device) -> wgpu::BindGroupLayou
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -4318,20 +4371,16 @@ fn downsample_rgba(width: u32, height: u32, rgba: &[u8]) -> (u32, u32, Vec<u8>) 
     (next_width, next_height, next)
 }
 
-/// Uploads one RGBA8 texture (with a full generated mip chain) and wraps it
-/// in a bind group matching `create_material_texture_layout`. Without
-/// mipmaps, the densely tiled terrain/wall textures alias into visible
-/// per-pixel noise as soon as the camera is more than a few quads away, so
-/// every material texture gets a complete chain down to 1×1.
-/// `width`/`height` must agree with `rgba.len() == width * height * 4`.
-fn create_material_bind_group(
+/// Uploads the borrowed base level plus a full generated mip chain. The
+/// worker caches views so independently sortable surfaces sharing a bitmap
+/// do not each allocate another copy of that texture on the GPU.
+fn create_material_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    layout: &wgpu::BindGroupLayout,
     width: u32,
     height: u32,
     rgba: &[u8],
-) -> wgpu::BindGroup {
+) -> wgpu::TextureView {
     let mip_level_count = u32::BITS - width.max(height).leading_zeros();
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("editor-material-texture"),
@@ -4377,8 +4426,11 @@ fn create_material_bind_group(
             level_rgba = Cow::Owned(next_rgba);
         }
     }
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn create_material_sampler(device: &wgpu::Device) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("editor-material-sampler"),
         address_mode_u: wgpu::AddressMode::Repeat,
         address_mode_v: wgpu::AddressMode::Repeat,
@@ -4392,6 +4444,40 @@ fn create_material_bind_group(
         // are Linear, which is what wgpu requires to accept this.
         anisotropy_clamp: 8,
         ..Default::default()
+    })
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MaterialUniform {
+    alpha_cutoff: f32,
+    alpha_source: u32,
+    _padding: [u32; 2],
+}
+
+fn create_material_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    texture: &wgpu::TextureView,
+    opacity: Option<&wgpu::TextureView>,
+    state: VisualMaterialState,
+) -> wgpu::BindGroup {
+    let uniform = MaterialUniform {
+        alpha_cutoff: state
+            .alpha_cutoff
+            .map_or(-1.0, |value| f32::from(value) / 255.0),
+        alpha_source: if opacity.is_some() {
+            2
+        } else {
+            u32::from(state.use_texture_alpha)
+        },
+        _padding: [0; 2],
+    };
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("editor-material-uniform"),
+        contents: bytemuck::bytes_of(&uniform),
+        usage: wgpu::BufferUsages::UNIFORM,
     });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("editor-material-bind-group"),
@@ -4399,56 +4485,120 @@ fn create_material_bind_group(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
+                resource: wgpu::BindingResource::TextureView(texture),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(opacity.unwrap_or(texture)),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: buffer.as_entire_binding(),
             },
         ],
     })
 }
 
 /// Flat neutral gray used for surfaces whose material didn't resolve to a
-/// decodable texture (unsupported format, or a Shader/Combiner/FinalBlend
-/// material graph not modelled yet).
+/// decodable texture (unsupported bitmap format or unresolved material graph).
 const FALLBACK_MATERIAL_RGBA: [u8; 4] = [170, 170, 170, 255];
 
-/// No cull mode: unlike the collision debug mesh, static mesh/BSP winding
-/// isn't normalized for the textured visualization (see
-/// `VisualMesh::append`), so double-sided rendering avoids missing faces at
-/// the cost of not culling backfaces.
+/// Only blend and depth affect pipeline compilation; authored alpha source
+/// and cutoff are material uniforms and must not multiply pipeline variants.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TexturedPipelineKey {
+    blend: VisualBlend,
+    depth_write: bool,
+    depth_test: bool,
+}
+
+impl From<VisualMaterialState> for TexturedPipelineKey {
+    fn from(state: VisualMaterialState) -> Self {
+        Self {
+            blend: state.blend,
+            depth_write: state.depth_write,
+            depth_test: state.depth_test,
+        }
+    }
+}
+
+/// Shared immutable shader/layout; scene-specific variants compile on the
+/// loader worker, never during drawing or before they are actually needed.
+struct TexturedPipelineResources {
+    shader: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+}
+
+impl TexturedPipelineResources {
+    fn new(
+        device: &wgpu::Device,
+        camera_layout: &wgpu::BindGroupLayout,
+        material_layout: &wgpu::BindGroupLayout,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            shader: device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("editor-textured-shader"),
+                source: wgpu::ShaderSource::Wgsl(TEXTURED_SHADER.into()),
+            }),
+            layout: device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("editor-textured-pipeline-layout"),
+                bind_group_layouts: &[camera_layout, material_layout],
+                push_constant_ranges: &[],
+            }),
+            format,
+        }
+    }
+}
+
+fn material_blend(blend: VisualBlend) -> Option<wgpu::BlendState> {
+    let (src_factor, dst_factor) = match blend {
+        VisualBlend::Opaque | VisualBlend::Invisible => return None,
+        VisualBlend::Alpha => (
+            wgpu::BlendFactor::SrcAlpha,
+            wgpu::BlendFactor::OneMinusSrcAlpha,
+        ),
+        VisualBlend::AlphaModulate => (wgpu::BlendFactor::Dst, wgpu::BlendFactor::OneMinusSrcAlpha),
+        VisualBlend::Translucent => (wgpu::BlendFactor::One, wgpu::BlendFactor::OneMinusSrc),
+        VisualBlend::Modulate => (wgpu::BlendFactor::Dst, wgpu::BlendFactor::Src),
+        VisualBlend::Brighten => (wgpu::BlendFactor::One, wgpu::BlendFactor::One),
+        VisualBlend::Darken => (wgpu::BlendFactor::Zero, wgpu::BlendFactor::OneMinusSrc),
+    };
+    Some(wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor,
+            dst_factor,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent::OVER,
+    })
+}
+
+/// No culling: the visual mesh/BSP winding is not normalized.
 fn create_textured_pipeline(
     device: &wgpu::Device,
-    camera_layout: &wgpu::BindGroupLayout,
-    material_layout: &wgpu::BindGroupLayout,
-    format: wgpu::TextureFormat,
+    resources: &TexturedPipelineResources,
+    key: TexturedPipelineKey,
 ) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("editor-textured-shader"),
-        source: wgpu::ShaderSource::Wgsl(TEXTURED_SHADER.into()),
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("editor-textured-pipeline-layout"),
-        bind_group_layouts: &[camera_layout, material_layout],
-        push_constant_ranges: &[],
-    });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("editor-textured-pipeline"),
-        layout: Some(&layout),
+        layout: Some(&resources.layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: &resources.shader,
             entry_point: "vs_main",
             buffers: &[TexturedVertex::layout()],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: &resources.shader,
             entry_point: "fs_main",
             targets: &[Some(wgpu::ColorTargetState {
-                format,
-                // The shader cuts masked texels out instead of blending
-                // them, so the pass stays opaque and depth-correct.
-                blend: None,
+                format: resources.format,
+                blend: material_blend(key.blend),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -4463,8 +4613,12 @@ fn create_textured_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: key.depth_write,
+            depth_compare: if key.depth_test {
+                wgpu::CompareFunction::Less
+            } else {
+                wgpu::CompareFunction::Always
+            },
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -4794,6 +4948,16 @@ var<uniform> camera: Camera;
 var material_texture: texture_2d<f32>;
 @group(1) @binding(1)
 var material_sampler: sampler;
+@group(1) @binding(2)
+var opacity_texture: texture_2d<f32>;
+
+struct Material {
+    alpha_cutoff: f32,
+    alpha_source: u32,
+    _padding: vec2<u32>,
+};
+@group(1) @binding(3)
+var<uniform> material: Material;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -4842,10 +5006,15 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let sample = textureSample(material_texture, material_sampler, input.uv);
-    // Masked foliage and grate textures are authored with a hard alpha
-    // edge. Cutting them out keeps depth correct, instead of the halos
-    // and sorting artefacts a blend produces on unsorted geometry.
-    if sample.a < 0.35 {
+    // Raw diffuse alpha can be specularity, not coverage. Only the resolved
+    // material graph may opt into it or into a distinct opacity bitmap.
+    var alpha = 1.0;
+    if material.alpha_source == 1u {
+        alpha = sample.a;
+    } else if material.alpha_source == 2u {
+        alpha = textureSample(opacity_texture, material_sampler, input.uv).a;
+    }
+    if alpha < material.alpha_cutoff {
         discard;
     }
 
@@ -4872,12 +5041,16 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let headlamp = HEADLAMP_INTENSITY * abs(dot(normal, view_direction));
     let light = hemisphere + SUN_COLOR * (sun * SUN_INTENSITY) + vec3<f32>(headlamp);
 
-    return vec4<f32>(sample.rgb * light, 1.0);
+    return vec4<f32>(sample.rgb * light, alpha);
 }
 "#;
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
+    use crate::unreal::{VisualMaterial, VisualScene, VisualTexture};
+
     use super::*;
 
     #[test]
@@ -4918,6 +5091,17 @@ mod tests {
         assert!(rect.right() <= 120.0 && rect.bottom() <= 90.0);
     }
 
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn opaque_material_keeps_pixels_with_specular_alpha() {
+        let opaque = render_textured_pixel([190, 150, 110, 255]).expect("GPU adapter");
+        let specular_alpha = render_textured_pixel([190, 150, 110, 0]).expect("GPU adapter");
+        assert_eq!(
+            specular_alpha, opaque,
+            "an opaque material must not turn its specularity mask into transparency"
+        );
+    }
+
     /// Renders one full-viewport, up-facing triangle through the real
     /// textured pipeline and returns the resolved frame. Exercises the WGSL,
     /// the MSAA attachments and the resolve in one shot.
@@ -4926,6 +5110,47 @@ mod tests {
     /// projection is identity), so `camera_position[1]` decides where the
     /// camera's eye level falls inside the frame.
     fn render_textured_frame(texel: [u8; 4], camera_position: [f32; 3]) -> Option<(u32, Vec<u8>)> {
+        render_visual_frame(
+            &[VisualScene {
+                batches: vec![material_triangle(texel, 0.0, Default::default(), None)],
+            }],
+            camera_position,
+        )
+    }
+
+    fn material_triangle(
+        texel: [u8; 4],
+        depth: f32,
+        state: VisualMaterialState,
+        opacity: Option<[u8; 4]>,
+    ) -> VisualBatch {
+        let texture = |rgba: [u8; 4]| VisualTexture {
+            width: 1,
+            height: 1,
+            rgba: Rc::from(rgba.as_slice()),
+        };
+        VisualBatch {
+            material: VisualMaterial {
+                texture: Some(texture(texel)),
+                opacity: opacity.map(texture),
+                state,
+            },
+            vertices: [
+                Vec3::new(-1.0, -1.0, depth),
+                Vec3::new(3.0, -1.0, depth),
+                Vec3::new(-1.0, 3.0, depth),
+            ]
+            .into_iter()
+            .map(|position| (position, Vec3::new(0.0, 1.0, 0.0), [0.0, 0.0]))
+            .collect(),
+            indices: vec![0, 1, 2],
+        }
+    }
+
+    fn render_visual_frame(
+        scenes: &[VisualScene],
+        camera_position: [f32; 3],
+    ) -> Option<(u32, Vec<u8>)> {
         const SIDE: u32 = 64;
 
         let instance = wgpu::Instance::default();
@@ -4942,19 +5167,7 @@ mod tests {
         .ok()?;
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let camera_layout = create_camera_layout(&device);
         // Identity view projection: vertices are given directly in NDC.
         let camera = CameraUniform::new(
             [
@@ -4980,37 +5193,24 @@ mod tests {
         });
 
         let material_layout = create_material_texture_layout(&device);
-        let material = create_material_bind_group(&device, &queue, &material_layout, 1, 1, &texel);
-        let pipeline = create_textured_pipeline(&device, &camera_layout, &material_layout, format);
-
-        // Normal points up, so the sun and the overhead camera both hit it.
-        let vertices = [
-            TexturedVertex {
-                position: [-1.0, -1.0, 0.0],
-                normal: [0.0, 1.0, 0.0],
-                uv: [0.0, 0.0],
-            },
-            TexturedVertex {
-                position: [3.0, -1.0, 0.0],
-                normal: [0.0, 1.0, 0.0],
-                uv: [0.0, 0.0],
-            },
-            TexturedVertex {
-                position: [-1.0, 3.0, 0.0],
-                normal: [0.0, 1.0, 0.0],
-                uv: [0.0, 0.0],
-            },
-        ];
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&[0u32, 1, 2]),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let resources =
+            TexturedPipelineResources::new(&device, &camera_layout, &material_layout, format);
+        let scenes: Vec<_> = scenes
+            .iter()
+            .map(|scene| {
+                let mut scene = TexturedScene::new(
+                    &device,
+                    &queue,
+                    &material_layout,
+                    &resources,
+                    scene,
+                    Vec3::new(0.0, 0.0, 0.0),
+                );
+                // Identity projection uses increasing Z for farther surfaces.
+                scene.sort_blended([0.0, 0.0, 1.0]);
+                scene
+            })
+            .collect();
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -5069,12 +5269,9 @@ mod tests {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &camera_bind_group, &[]);
-            pass.set_bind_group(1, &material, &[]);
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..3, 0, 0..1);
+            for scene in &scenes {
+                scene.draw(&mut pass, &camera_bind_group);
+            }
         }
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
@@ -5108,7 +5305,21 @@ mod tests {
 
     /// Centre pixel of the default overhead-camera frame.
     fn render_textured_pixel(texel: [u8; 4]) -> Option<[u8; 4]> {
-        let (side, pixels) = render_textured_frame(texel, [0.0, 1000.0, 0.0])?;
+        render_material_pixel(texel, Default::default(), None)
+    }
+
+    fn render_material_pixel(
+        texel: [u8; 4],
+        state: VisualMaterialState,
+        opacity: Option<[u8; 4]>,
+    ) -> Option<[u8; 4]> {
+        render_scene_pixel(&[VisualScene {
+            batches: vec![material_triangle(texel, 0.0, state, opacity)],
+        }])
+    }
+
+    fn render_scene_pixel(scenes: &[VisualScene]) -> Option<[u8; 4]> {
+        let (side, pixels) = render_visual_frame(scenes, [0.0, 1000.0, 0.0])?;
         let middle = ((side / 2 * side + side / 2) * 4) as usize;
         Some([
             pixels[middle],
@@ -5156,19 +5367,7 @@ mod tests {
         .expect("create device");
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let camera_layout = create_camera_layout(&device);
 
         let mut camera = Camera::for_bounds(source_map.bounds);
         // "x,y,z,yaw_deg,pitch_deg" overrides the overview shot.
@@ -5199,8 +5398,29 @@ mod tests {
         });
 
         let material_layout = create_material_texture_layout(&device);
-        let pipeline = create_textured_pipeline(&device, &camera_layout, &material_layout, format);
-        let textured = TexturedScene::new(&device, &queue, &material_layout, &scene, origin);
+        let resources =
+            TexturedPipelineResources::new(&device, &camera_layout, &material_layout, format);
+        let mut textured = TexturedScene::new(
+            &device,
+            &queue,
+            &material_layout,
+            &resources,
+            &scene,
+            origin,
+        );
+        textured.sort_blended(camera.forward());
+        // Keep batch isolation while exercising the same sorted, material-aware
+        // drawing path as the interactive editor.
+        let only = std::env::var("GEODATA_EDITOR_ONLY_BATCH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let skip = std::env::var("GEODATA_EDITOR_SKIP_BATCH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let visible =
+            |index: usize| only.is_none_or(|wanted| wanted == index) && skip != Some(index);
+        textured.opaque_order.retain(|index| visible(*index));
+        textured.blended_order.retain(|(index, _)| visible(*index));
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -5259,25 +5479,7 @@ mod tests {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // Isolating a batch is how an overlap between two coincident
-            // surfaces gets attributed to a specific one.
-            let only = std::env::var("GEODATA_EDITOR_ONLY_BATCH")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok());
-            let skip = std::env::var("GEODATA_EDITOR_SKIP_BATCH")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok());
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &camera_bind_group, &[]);
-            for (index, batch) in textured.batches.iter().enumerate() {
-                if only.is_some_and(|wanted| wanted != index) || skip == Some(index) {
-                    continue;
-                }
-                pass.set_bind_group(1, &batch.material, &[]);
-                pass.set_vertex_buffer(0, batch.vertices.slice(..));
-                pass.set_index_buffer(batch.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..batch.index_count, 0, 0..1);
-            }
+            textured.draw(&mut pass, &camera_bind_group);
         }
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
@@ -5360,14 +5562,225 @@ mod tests {
     fn masked_texels_are_cut_out_instead_of_blended() {
         // Foliage cards rely on this: an almost transparent texel has to
         // leave the background untouched and write no depth.
-        let Some(pixel) = render_textured_pixel([255, 255, 255, 25]) else {
-            panic!("no GPU adapter available");
-        };
+        let pixel = render_material_pixel(
+            [255, 255, 255, 25],
+            VisualMaterialState {
+                alpha_cutoff: Some(128),
+                use_texture_alpha: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("GPU adapter");
         assert_eq!(
             pixel[..3],
             [0, 0, 0],
             "masked texel was drawn instead of discarded"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn masked_material_honors_authored_alpha_threshold_boundary() {
+        let state = VisualMaterialState {
+            alpha_cutoff: Some(20),
+            use_texture_alpha: true,
+            ..Default::default()
+        };
+        let below = render_material_pixel([190, 150, 110, 19], state, None).expect("GPU adapter");
+        let equal = render_material_pixel([190, 150, 110, 20], state, None).expect("GPU adapter");
+        let opaque = render_textured_pixel([190, 150, 110, 255]).expect("GPU adapter");
+        assert_eq!(below[..3], [0, 0, 0]);
+        assert_eq!(equal[..3], opaque[..3], "the authored cutoff is inclusive");
+
+        let zero = render_material_pixel(
+            [190, 150, 110, 0],
+            VisualMaterialState {
+                alpha_cutoff: Some(0),
+                ..state
+            },
+            None,
+        )
+        .expect("GPU adapter");
+        assert_eq!(
+            zero[..3],
+            opaque[..3],
+            "AlphaRef=0 must not invent a cutoff"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn separate_opacity_controls_coverage_without_replacing_diffuse_color() {
+        let state = VisualMaterialState {
+            alpha_cutoff: Some(20),
+            ..Default::default()
+        };
+        let hidden = render_material_pixel([190, 150, 110, 255], state, Some([255, 255, 255, 19]))
+            .expect("GPU adapter");
+        let visible = render_material_pixel([190, 150, 110, 0], state, Some([0, 255, 0, 20]))
+            .expect("GPU adapter");
+        let opaque = render_textured_pixel([190, 150, 110, 255]).expect("GPU adapter");
+        assert_eq!(hidden[..3], [0, 0, 0]);
+        assert_eq!(
+            visible[..3],
+            opaque[..3],
+            "opacity RGB must not tint diffuse"
+        );
+    }
+
+    fn assert_linear_pixel(pixel: [u8; 4], expected: [f32; 3]) {
+        for channel in 0..3 {
+            let expected = linear_to_srgb(expected[channel]);
+            assert!(
+                pixel[channel].abs_diff(expected) <= 2,
+                "channel {channel}: rendered {}, expected {expected} (pixel {pixel:?})",
+                pixel[channel],
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn material_blend_modes_composite_with_unreal_framebuffer_factors() {
+        let source_texel = [180, 110, 60, 128];
+        let background_texel = [70, 100, 160, 255];
+        let source = render_textured_pixel(source_texel).expect("GPU adapter");
+        let background = render_textured_pixel(background_texel).expect("GPU adapter");
+        let alpha = 128.0 / 255.0;
+        for blend in [
+            VisualBlend::Alpha,
+            VisualBlend::AlphaModulate,
+            VisualBlend::Translucent,
+            VisualBlend::Modulate,
+            VisualBlend::Brighten,
+            VisualBlend::Darken,
+        ] {
+            let pixel = render_scene_pixel(&[VisualScene {
+                batches: vec![
+                    material_triangle(
+                        source_texel,
+                        0.2,
+                        VisualMaterialState {
+                            blend,
+                            use_texture_alpha: true,
+                            depth_write: false,
+                            ..Default::default()
+                        },
+                        None,
+                    ),
+                    material_triangle(background_texel, 0.8, Default::default(), None),
+                ],
+            }])
+            .expect("GPU adapter");
+            let expected = std::array::from_fn(|channel| {
+                let src = SRGB_TO_LINEAR[source[channel] as usize];
+                let dst = SRGB_TO_LINEAR[background[channel] as usize];
+                match blend {
+                    VisualBlend::Alpha => src * alpha + dst * (1.0 - alpha),
+                    VisualBlend::AlphaModulate => src * dst + dst * (1.0 - alpha),
+                    VisualBlend::Translucent => src + dst * (1.0 - src),
+                    VisualBlend::Modulate => 2.0 * src * dst,
+                    VisualBlend::Brighten => src + dst,
+                    VisualBlend::Darken => dst * (1.0 - src),
+                    VisualBlend::Opaque | VisualBlend::Invisible => unreachable!(),
+                }
+            });
+            assert_linear_pixel(pixel, expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn alpha_surfaces_sort_back_to_front_after_opaque_geometry() {
+        let state = VisualMaterialState {
+            blend: VisualBlend::Alpha,
+            use_texture_alpha: true,
+            depth_write: false,
+            ..Default::default()
+        };
+        let near = material_triangle([255, 0, 0, 128], 0.2, state, None);
+        let middle = material_triangle([0, 255, 0, 128], 0.5, state, None);
+        let far = material_triangle([0, 0, 255, 255], 0.8, Default::default(), None);
+        let pixel = render_scene_pixel(&[VisualScene {
+            batches: vec![near, far, middle],
+        }])
+        .expect("GPU adapter");
+        let white = render_textured_pixel([255, 255, 255, 255]).expect("GPU adapter");
+        let alpha = 128.0 / 255.0;
+        assert_linear_pixel(
+            pixel,
+            [
+                SRGB_TO_LINEAR[white[0] as usize] * alpha,
+                SRGB_TO_LINEAR[white[1] as usize] * alpha * (1.0 - alpha),
+                SRGB_TO_LINEAR[white[2] as usize] * (1.0 - alpha) * (1.0 - alpha),
+            ],
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn blended_material_depth_flags_control_later_fragments() {
+        let background = || material_triangle([0, 0, 255, 255], 0.8, Default::default(), None);
+        let later = || material_triangle([0, 255, 0, 255], 0.5, Default::default(), None);
+        let green = render_scene_pixel(&[VisualScene {
+            batches: vec![later()],
+        }])
+        .expect("GPU adapter");
+        let state = VisualMaterialState {
+            blend: VisualBlend::Alpha,
+            use_texture_alpha: true,
+            depth_write: false,
+            ..Default::default()
+        };
+        let near = || material_triangle([255, 0, 0, 128], 0.2, state, None);
+        let composed = render_scene_pixel(&[VisualScene {
+            batches: vec![background(), near()],
+        }])
+        .expect("GPU adapter");
+        for depth_write in [false, true] {
+            let mut near = near();
+            near.material.state.depth_write = depth_write;
+            let pixel = render_scene_pixel(&[
+                VisualScene {
+                    batches: vec![background(), near],
+                },
+                VisualScene {
+                    batches: vec![later()],
+                },
+            ])
+            .expect("GPU adapter");
+            assert_eq!(pixel, if depth_write { composed } else { green });
+        }
+
+        // Disabling depth testing must also let a blended surface behind an
+        // opaque wall contribute; enabling it must leave the wall untouched.
+        let wall = || material_triangle([0, 255, 0, 255], 0.1, Default::default(), None);
+        let wall_pixel = render_scene_pixel(&[VisualScene {
+            batches: vec![wall()],
+        }])
+        .expect("GPU adapter");
+        for depth_test in [false, true] {
+            let mut behind = near();
+            behind.material.state.depth_test = depth_test;
+            let pixel = render_scene_pixel(&[VisualScene {
+                batches: vec![wall(), behind],
+            }])
+            .expect("GPU adapter");
+            if depth_test {
+                assert_eq!(pixel, wall_pixel);
+            } else {
+                let alpha = 128.0 / 255.0;
+                assert_linear_pixel(
+                    pixel,
+                    [
+                        SRGB_TO_LINEAR[composed[0] as usize],
+                        SRGB_TO_LINEAR[wall_pixel[1] as usize] * (1.0 - alpha),
+                        0.0,
+                    ],
+                );
+            }
+        }
     }
 
     #[test]
@@ -5902,7 +6315,7 @@ mod tests {
         let origin = map_origin(bounds);
         let corner = Vec3::new(-98_304.0, -3_205.0, 131_072.0);
         let batch = VisualBatch {
-            texture: None,
+            material: Default::default(),
             vertices: vec![(corner, Vec3::new(0.0, 1.0, 0.0), [0.25, 0.75])],
             indices: vec![0],
         };

@@ -1,6 +1,7 @@
 //! Background project decoding and GPU preparation; only completed resources reach the UI.
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -13,14 +14,15 @@ use wgpu::util::DeviceExt;
 
 use super::{
     CollisionMeshes, EditorUi, EditorView, FALLBACK_MATERIAL_RGBA, PendingFlavour, TexturedBatch,
-    TexturedScene, create_material_bind_group, map_origin, map_package_or_prompt,
-    overlays::OverlayMeshes, textured_batch_vertices,
+    TexturedPipelineKey, TexturedPipelineResources, TexturedScene, create_material_bind_group,
+    create_material_sampler, create_material_texture, create_textured_pipeline, map_origin,
+    map_package_or_prompt, overlays::OverlayMeshes, textured_batch_vertices,
 };
 use crate::{
     editor::{self, EditorMemory, MapType},
     geometry::Vec3,
     l2j::Document,
-    unreal::{PackageLoader, SourceMap, VisualScene},
+    unreal::{PackageLoader, SourceMap, VisualBlend, VisualScene, VisualTexture},
 };
 
 /// One receiver owns the admission slot until its result is consumed. Repeated
@@ -74,6 +76,7 @@ struct GpuContext {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     material_layout: Arc<wgpu::BindGroupLayout>,
+    pipelines: Arc<TexturedPipelineResources>,
 }
 
 struct PreparedProject {
@@ -285,6 +288,7 @@ impl EditorView {
             device: Arc::clone(&self.preview.device),
             queue: Arc::clone(&self.preview.queue),
             material_layout: Arc::clone(&self.preview.material_texture_layout),
+            pipelines: Arc::clone(&self.preview.textured_pipelines),
         }
     }
 }
@@ -396,6 +400,7 @@ fn prepare_visual(
         &gpu.device,
         &gpu.queue,
         &gpu.material_layout,
+        &gpu.pipelines,
         &scene,
         origin,
     );
@@ -414,54 +419,105 @@ impl TexturedScene {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         material_layout: &wgpu::BindGroupLayout,
+        resources: &TexturedPipelineResources,
         scene: &VisualScene,
         origin: Vec3,
     ) -> Self {
-        let batches = scene
-            .batches
-            .iter()
-            .filter(|batch| !batch.indices.is_empty())
-            .map(|batch| {
-                let vertices = textured_batch_vertices(batch, origin);
-                let material = match &batch.texture {
-                    Some(texture) if texture.width > 0 && texture.height > 0 => {
-                        create_material_bind_group(
-                            device,
-                            queue,
-                            material_layout,
-                            texture.width,
-                            texture.height,
-                            &texture.rgba,
-                        )
-                    }
-                    _ => create_material_bind_group(
-                        device,
-                        queue,
-                        material_layout,
-                        1,
-                        1,
-                        &FALLBACK_MATERIAL_RGBA,
-                    ),
-                };
-                let prepared = TexturedBatch {
-                    vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("editor-textured-batch-vertices"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                    indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("editor-textured-batch-indices"),
-                        contents: bytemuck::cast_slice(&batch.indices),
-                        usage: wgpu::BufferUsages::INDEX,
-                    }),
-                    index_count: batch.indices.len() as u32,
-                    material,
-                };
-                finish_upload_batch(device, queue);
+        let mut textures = HashMap::new();
+        let sampler = create_material_sampler(device);
+        let texture_key = |texture: Option<&VisualTexture>| {
+            texture.map(|texture| (texture.width, texture.height, texture.rgba.as_ptr()))
+        };
+        let mut texture_view = |texture: Option<&VisualTexture>| {
+            Arc::clone(textures.entry(texture_key(texture)).or_insert_with(|| {
+                let (width, height, rgba) = texture
+                    .map_or((1, 1, FALLBACK_MATERIAL_RGBA.as_slice()), |texture| {
+                        (texture.width, texture.height, texture.rgba.as_ref())
+                    });
+                Arc::new(create_material_texture(device, queue, width, height, rgba))
+            }))
+        };
+        let mut materials = HashMap::new();
+        let mut pipeline_indices = HashMap::new();
+        let mut prepared = Self {
+            batches: Vec::with_capacity(scene.batches.len()),
+            pipelines: Vec::new(),
+            opaque_order: Vec::new(),
+            blended_order: Vec::new(),
+            sort_direction: None,
+        };
+        for batch in &scene.batches {
+            let state = batch.material.state;
+            if batch.indices.is_empty() || state.blend == VisualBlend::Invisible {
+                continue;
+            }
+            let pipeline_key = TexturedPipelineKey::from(state);
+            let pipeline = *pipeline_indices.entry(pipeline_key).or_insert_with(|| {
+                let index = prepared.pipelines.len();
                 prepared
-            })
-            .collect();
-        Self { batches }
+                    .pipelines
+                    .push(create_textured_pipeline(device, resources, pipeline_key));
+                index
+            });
+            let diffuse = batch
+                .material
+                .texture
+                .as_ref()
+                .filter(|texture| texture.width > 0 && texture.height > 0);
+            let opacity = batch
+                .material
+                .opacity
+                .as_ref()
+                .filter(|texture| texture.width > 0 && texture.height > 0);
+            let material_key = (state, texture_key(diffuse), texture_key(opacity));
+            let material = Arc::clone(materials.entry(material_key).or_insert_with(|| {
+                let diffuse = texture_view(diffuse);
+                let opacity = opacity.map(|texture| texture_view(Some(texture)));
+                Arc::new(create_material_bind_group(
+                    device,
+                    material_layout,
+                    &sampler,
+                    &diffuse,
+                    opacity.as_deref(),
+                    state,
+                ))
+            }));
+            let vertices = textured_batch_vertices(batch, origin);
+            let index = prepared.batches.len();
+            let center = if state.blend == VisualBlend::Opaque {
+                prepared.opaque_order.push(index);
+                [0.0; 3]
+            } else {
+                prepared.blended_order.push((index, 0.0));
+                let mut min = [f32::INFINITY; 3];
+                let mut max = [f32::NEG_INFINITY; 3];
+                for vertex in &vertices {
+                    for axis in 0..3 {
+                        min[axis] = min[axis].min(vertex.position[axis]);
+                        max[axis] = max[axis].max(vertex.position[axis]);
+                    }
+                }
+                std::array::from_fn(|axis| (min[axis] + max[axis]) * 0.5)
+            };
+            prepared.batches.push(TexturedBatch {
+                vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("editor-textured-batch-vertices"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("editor-textured-batch-indices"),
+                    contents: bytemuck::cast_slice(&batch.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+                index_count: batch.indices.len() as u32,
+                material,
+                pipeline,
+                center,
+            });
+            finish_upload_batch(device, queue);
+        }
+        prepared
     }
 }
 
@@ -480,7 +536,10 @@ mod tests {
     };
     use crate::{
         editor::{self, MapType},
-        editor_view::{EditorUi, create_material_texture_layout},
+        editor_view::{
+            EditorUi, TexturedPipelineResources, create_camera_layout,
+            create_material_texture_layout,
+        },
         l2j::Document,
     };
 
@@ -567,12 +626,20 @@ mod tests {
         ))
         .expect("GPU device");
         let material_layout = Arc::new(create_material_texture_layout(&device));
+        let camera_layout = create_camera_layout(&device);
+        let pipelines = Arc::new(TexturedPipelineResources::new(
+            &device,
+            &camera_layout,
+            &material_layout,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        ));
         let device = Arc::new(device);
         let queue = Arc::new(queue);
         let gpu_context = || GpuContext {
             device: Arc::clone(&device),
             queue: Arc::clone(&queue),
             material_layout: Arc::clone(&material_layout),
+            pipelines: Arc::clone(&pipelines),
         };
         let mut settings = ProjectSettings {
             client_root,

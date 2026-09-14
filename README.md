@@ -46,6 +46,12 @@ permanece visível até a substituição estar pronta; a edição fica bloqueada
 a troca de projeto. A primeira ativação de texturas prepara os materiais, e as
 ativações seguintes reutilizam a cena carregada.
 
+Materiais opacos ignoram o alpha usado para especularidade. Materiais mascarados
+respeitam o `AlphaRef` do cliente; opacidade separada e modos de composição são
+preservados, com superfícies transparentes ordenadas de trás para frente.
+A cena visual inclui BSP não sólido, sem incluir superfícies invisíveis ou
+portais de zona/céu; os filtros da geometria de colisão permanecem independentes.
+
 O contador de blocos alterados é incremental. Os overlays são atualizados em
 chunks de 16×16 blocos, com buffers reutilizados; ícones NSWE ocultos só são
 atualizados quando voltam a ficar visíveis.

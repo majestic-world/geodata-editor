@@ -18,6 +18,12 @@ const RF_HAS_STACK: u32 = 0x0200_0000;
 const RF_NATIVE: u32 = 0x0400_0000;
 const NF_PASSABLE: u8 = 0x01;
 const PF_PASSABLE: u32 = 0x0400_00df;
+const PF_INVISIBLE: u32 = 0x0000_0001;
+const PF_MASKED: u32 = 0x0000_0002;
+const PF_TRANSLUCENT: u32 = 0x0000_0004;
+const PF_MODULATED: u32 = 0x0000_0040;
+const PF_FAKE_BACKDROP: u32 = 0x0000_0080;
+const PF_PORTAL: u32 = 0x0400_0000;
 
 #[derive(Clone, Debug)]
 pub struct SourceMap {
@@ -100,6 +106,7 @@ impl SourceMap {
 pub struct PackageLoader {
     root: PathBuf,
     archives: RefCell<HashMap<String, Rc<Archive>>>,
+    visual_materials: RefCell<HashMap<(usize, i32), VisualMaterial>>,
     loaded_package_count: RefCell<usize>,
     log_level: u8,
     verbose: bool,
@@ -110,6 +117,7 @@ impl PackageLoader {
         Self {
             root,
             archives: RefCell::new(HashMap::new()),
+            visual_materials: RefCell::new(HashMap::new()),
             loaded_package_count: RefCell::new(0),
             log_level,
             verbose,
@@ -290,7 +298,7 @@ impl PackageLoader {
     /// Builds a textured representation of the map for the textured
     /// visualization mode (Fase 3-5 v1): every static mesh surface
     /// (regardless of collision flags) and every visible BSP surface,
-    /// grouped by material texture, plus the terrain's base layer texture
+    /// grouped by complete material state, plus the terrain's base layer texture
     /// (no alpha blending between layers yet). Heavier than `load_map`
     /// (decodes every referenced texture), so callers should only invoke it
     /// when the textured view is actually enabled.
@@ -313,8 +321,8 @@ impl PackageLoader {
                     let scale = terrain.scale();
                     let mesh =
                         terrain_visual_mesh(&terrain, &heightmap, base_layer, position, scale)?;
-                    let texture = self.visual_texture_ref(&archive, base_layer.texture_index)?;
-                    builder.add(texture, &mesh, Transform::default());
+                    let material = self.visual_material_ref(&archive, base_layer.texture_index)?;
+                    builder.add(material, &mesh, Transform::default());
                 }
             }
         }
@@ -346,11 +354,11 @@ impl PackageLoader {
                     }
                     // Material indices belong to the package the mesh was
                     // serialized in, which is rarely the map itself.
-                    let texture = match material_index {
-                        Some(index) => self.visual_texture_ref(&mesh_archive, index)?,
-                        None => None,
+                    let material = match material_index {
+                        Some(index) => self.visual_material_ref(&mesh_archive, index)?,
+                        None => VisualMaterial::default(),
                     };
-                    builder.add(texture, &surface_mesh, transform);
+                    builder.add(material, &surface_mesh, transform);
                 }
             }
         }
@@ -360,18 +368,19 @@ impl PackageLoader {
                 continue;
             };
             let model = self.model_ref(&archive, level.model_index, "Level.Model")?;
-            for (material_index, mut mesh) in model.visual_surfaces()? {
+            for (material_index, polygon_flags, mut mesh) in model.visual_surfaces()? {
                 if exceeds_region_tile(&mesh, Transform::default()) {
                     continue;
                 }
-                let texture = match material_index {
-                    Some(index) => self.visual_texture_ref(&archive, index)?,
-                    None => None,
+                let mut material = match material_index {
+                    Some(index) => self.visual_material_ref(&archive, index)?,
+                    None => VisualMaterial::default(),
                 };
+                material.apply_polygon_flags(polygon_flags);
                 // `Model::visual_surfaces` returns texel-space UV (Unreal's
                 // native BSP mapping); normalize it to 0..1 now that the
                 // resolved texture's real dimensions are known.
-                if let Some(texture) = &texture {
+                if let Some(texture) = &material.texture {
                     let width = texture.width.max(1) as f32;
                     let height = texture.height.max(1) as f32;
                     for vertex in &mut mesh.vertices {
@@ -379,7 +388,7 @@ impl PackageLoader {
                         vertex.uv[1] /= height;
                     }
                 }
-                builder.add(texture, &mesh, Transform::default());
+                builder.add(material, &mesh, Transform::default());
             }
         }
         Ok(builder.finish())
@@ -425,51 +434,104 @@ impl PackageLoader {
         }
     }
 
-    /// Resolves a `Materials[i].Material` or BSP surface material index to
-    /// its decoded texture, following Unreal's material graph until a plain
-    /// bitmap turns up. `None` covers every expected "no texture here" case:
-    /// a zero/absent reference, an import that can't be found, a texture in
-    /// a format the decoder doesn't cover, and graphs that bottom out in a
-    /// node carrying no bitmap at all, so those surfaces render untextured
-    /// instead of failing the whole map.
-    fn visual_texture_ref(
+    /// Resolve the material graph, retaining authored alpha and depth state.
+    /// Missing or unsupported textures remain an untextured surface.
+    fn visual_material_ref(&self, archive: &Rc<Archive>, index: i32) -> Result<VisualMaterial> {
+        let key = (Rc::as_ptr(archive) as usize, index);
+        if let Some(material) = self.visual_materials.borrow().get(&key) {
+            return Ok(material.clone());
+        }
+        let material = self.visual_material_at(archive, index, 0)?;
+        self.visual_materials
+            .borrow_mut()
+            .insert(key, material.clone());
+        Ok(material)
+    }
+
+    fn visual_material_at(
         &self,
         archive: &Rc<Archive>,
         index: i32,
-    ) -> Result<Option<VisualTexture>> {
-        // Depth guard: material graphs are shallow by construction, and a
-        // malformed package must not spin here.
-        const MAX_MATERIAL_DEPTH: usize = 8;
-
-        let mut owner = Rc::clone(archive);
-        let mut index = index;
-        for _ in 0..MAX_MATERIAL_DEPTH {
-            if index == 0 {
-                return Ok(None);
-            }
-            let resolved = match owner.object_at(index, self) {
-                Ok(resolved) => resolved,
-                Err(AppError::Missing(_)) => return Ok(None),
-                Err(error) => return Err(error),
-            };
-            match resolved.object.as_ref() {
-                Object::Texture(texture) => {
-                    return Ok(texture.rgba.clone().map(|rgba| VisualTexture {
-                        width: texture.u_size.max(0) as u32,
-                        height: texture.v_size.max(0) as u32,
-                        rgba,
-                    }));
-                }
-                // A modifier's forward edge can point into another package,
-                // so the owning archive has to travel with the index.
-                Object::Material(wrapper) => {
-                    index = wrapper.inner;
-                    owner = resolved.archive;
-                }
-                _ => return Ok(None),
-            }
+        depth: usize,
+    ) -> Result<VisualMaterial> {
+        // Bound every graph edge, including opacity edges and cross-package cycles.
+        if index == 0 || depth >= 16 {
+            return Ok(VisualMaterial::default());
         }
-        Ok(None)
+        let resolved = match archive.object_at(index, self) {
+            Ok(resolved) => resolved,
+            Err(AppError::Missing(_)) => return Ok(VisualMaterial::default()),
+            Err(error) => return Err(error),
+        };
+        match resolved.object.as_ref() {
+            Object::Texture(texture) => Ok(texture.visual_material()),
+            Object::Material(wrapper) => {
+                let mut material =
+                    self.visual_material_at(&resolved.archive, wrapper.inner, depth + 1)?;
+                match wrapper.kind {
+                    MaterialKind::Modifier => {}
+                    MaterialKind::Shader {
+                        opacity,
+                        output,
+                        alpha_test,
+                        alpha_ref,
+                    } => {
+                        if opacity != 0 {
+                            let source =
+                                self.visual_opacity_at(&resolved.archive, opacity, depth + 1)?;
+                            material.set_opacity(source);
+                        }
+                        material.apply_shader(output, opacity != 0, alpha_test, alpha_ref);
+                    }
+                    MaterialKind::FinalBlend(state) => {
+                        let use_texture_alpha = state.alpha_cutoff.is_some()
+                            || matches!(
+                                state.blend,
+                                VisualBlend::Alpha | VisualBlend::AlphaModulate
+                            );
+                        material.state = state;
+                        material.state.use_texture_alpha =
+                            use_texture_alpha && material.opacity.is_none();
+                    }
+                    MaterialKind::Combiner { alpha_source } => {
+                        let source =
+                            self.visual_opacity_at(&resolved.archive, alpha_source, depth + 1)?;
+                        material.set_opacity(source);
+                    }
+                }
+                Ok(material)
+            }
+            _ => Ok(VisualMaterial::default()),
+        }
+    }
+
+    /// Shader.Opacity consumes a material's alpha, not its render/blend flags.
+    fn visual_opacity_at(
+        &self,
+        archive: &Rc<Archive>,
+        index: i32,
+        depth: usize,
+    ) -> Result<Option<VisualTexture>> {
+        if index == 0 || depth >= 16 {
+            return Ok(None);
+        }
+        let resolved = match archive.object_at(index, self) {
+            Ok(resolved) => resolved,
+            Err(AppError::Missing(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match resolved.object.as_ref() {
+            Object::Texture(texture) => Ok(texture.visual_texture()),
+            Object::Material(wrapper) => {
+                let index = match wrapper.kind {
+                    MaterialKind::Shader { opacity, .. } if opacity != 0 => opacity,
+                    MaterialKind::Combiner { alpha_source } => alpha_source,
+                    _ => wrapper.inner,
+                };
+                self.visual_opacity_at(&resolved.archive, index, depth + 1)
+            }
+            _ => Ok(None),
+        }
     }
     /// The static mesh plus the archive it lives in. Callers need the owner
     /// to resolve the mesh's own material references.
@@ -797,6 +859,7 @@ impl Archive {
                 self,
                 reader,
                 export.flags,
+                &export.class_name,
             )?)),
             _ => Ok(Object::Unknown),
         }
@@ -880,27 +943,87 @@ impl Object {
     }
 }
 
-/// A node in Unreal's material graph that wraps another material: `Shader`,
-/// `Combiner`, `FinalBlend`, `ColorModifier` and the `Tex*` modifiers. The
-/// textured visualization only needs the bitmap at the bottom of the chain,
-/// so each node is reduced to the reference it forwards to.
+/// Material references remain relative to the archive containing this node.
 #[derive(Clone, Copy)]
 struct MaterialWrapper {
     inner: i32,
+    kind: MaterialKind,
+}
+
+#[derive(Clone, Copy)]
+enum MaterialKind {
+    Modifier,
+    Shader {
+        opacity: i32,
+        output: u8,
+        alpha_test: Option<bool>,
+        alpha_ref: Option<u8>,
+    },
+    FinalBlend(VisualMaterialState),
+    Combiner {
+        alpha_source: i32,
+    },
 }
 
 impl MaterialWrapper {
-    fn read(archive: &Archive, reader: &mut Reader<'_>, flags: u32) -> Result<Self> {
+    fn read(archive: &Archive, reader: &mut Reader<'_>, flags: u32, class: &str) -> Result<Self> {
         let props = read_properties(archive, reader, flags)?;
-        // Order matters. On a `Shader`, `Diffuse` is the visible bitmap while
-        // `Material` (when present at all) is a secondary input; on the
-        // modifiers and `FinalBlend`, `Material` is the only forward edge.
-        // `Combiner` mixes two inputs and `Material1` is the base layer.
-        let inner = ["Diffuse", "Material", "Material1", "Material2"]
-            .into_iter()
-            .find_map(|name| props.index(name))
-            .unwrap_or(0);
-        Ok(Self { inner })
+        Ok(Self::from_properties(class, &props))
+    }
+
+    fn from_properties(class: &str, props: &Properties) -> Self {
+        let inner = match class {
+            "Shader" => props.index("Diffuse").unwrap_or(0),
+            "Combiner" => {
+                let source = match props.byte("CombineOperation").unwrap_or(0) {
+                    1 => "Material2",
+                    7 => "Mask",
+                    _ => "Material1",
+                };
+                props.index(source).unwrap_or(0)
+            }
+            _ => props.index("Material").unwrap_or(0),
+        };
+        let kind = match class {
+            "Shader" => MaterialKind::Shader {
+                opacity: props.index("Opacity").unwrap_or(0),
+                output: props.byte("OutputBlending").unwrap_or(0),
+                alpha_test: props.get("AlphaTest").map(|_| props.boolean("AlphaTest")),
+                alpha_ref: props.byte("AlphaRef"),
+            },
+            "FinalBlend" => MaterialKind::FinalBlend(VisualMaterialState {
+                blend: match props.byte("FrameBufferBlending").unwrap_or(0) {
+                    1 => VisualBlend::Modulate,
+                    2 => VisualBlend::Alpha,
+                    3 => VisualBlend::AlphaModulate,
+                    4 => VisualBlend::Translucent,
+                    5 => VisualBlend::Darken,
+                    6 => VisualBlend::Brighten,
+                    7 => VisualBlend::Invisible,
+                    _ => VisualBlend::Opaque,
+                },
+                alpha_cutoff: props
+                    .boolean("AlphaTest")
+                    .then(|| props.byte("AlphaRef").unwrap_or(0)),
+                depth_write: props.boolean_or("ZWrite", true),
+                depth_test: props.boolean_or("ZTest", true),
+                use_texture_alpha: false,
+            }),
+            // Epic's UE2 Combiner AlphaOperation selects alpha independently
+            // of the color input. No Mask means opaque, not Material1's alpha.
+            "Combiner" => MaterialKind::Combiner {
+                alpha_source: match props.byte("AlphaOperation").unwrap_or(0) {
+                    0 => props.index("Mask").unwrap_or(0),
+                    3 => props.index("Material1").unwrap_or(0),
+                    4 => props.index("Material2").unwrap_or(0),
+                    // Arithmetic alpha graphs are not represented by a single
+                    // source texture; do not substitute Material1's alpha.
+                    _ => 0,
+                },
+            },
+            _ => MaterialKind::Modifier,
+        };
+        Self { inner, kind }
     }
 }
 
@@ -923,6 +1046,115 @@ pub struct VisualTexture {
     pub width: u32,
     pub height: u32,
     pub rgba: Rc<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VisualBlend {
+    #[default]
+    Opaque,
+    Alpha,
+    AlphaModulate,
+    Translucent,
+    Modulate,
+    Brighten,
+    Darken,
+    Invisible,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VisualMaterialState {
+    pub blend: VisualBlend,
+    pub alpha_cutoff: Option<u8>,
+    pub use_texture_alpha: bool,
+    pub depth_write: bool,
+    pub depth_test: bool,
+}
+
+impl Default for VisualMaterialState {
+    fn default() -> Self {
+        Self {
+            blend: VisualBlend::Opaque,
+            alpha_cutoff: None,
+            use_texture_alpha: false,
+            depth_write: true,
+            depth_test: true,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct VisualMaterial {
+    pub texture: Option<VisualTexture>,
+    pub opacity: Option<VisualTexture>,
+    pub state: VisualMaterialState,
+}
+
+impl VisualMaterial {
+    fn set_opacity(&mut self, source: Option<VisualTexture>) {
+        self.state.use_texture_alpha = self
+            .texture
+            .as_ref()
+            .zip(source.as_ref())
+            .is_some_and(|(texture, source)| Rc::ptr_eq(&texture.rgba, &source.rgba));
+        self.opacity = if self.state.use_texture_alpha {
+            None
+        } else {
+            source
+        };
+    }
+
+    fn apply_shader(
+        &mut self,
+        output: u8,
+        has_opacity: bool,
+        alpha_test: Option<bool>,
+        alpha_ref: Option<u8>,
+    ) {
+        self.state.blend = match output {
+            0 if has_opacity => VisualBlend::Alpha,
+            0 => self.state.blend,
+            1 => VisualBlend::Opaque,
+            2 => VisualBlend::Modulate,
+            3 => VisualBlend::Translucent,
+            4 => VisualBlend::Invisible,
+            5 => VisualBlend::Brighten,
+            6 => VisualBlend::Darken,
+            _ => self.state.blend,
+        };
+        self.state.alpha_cutoff = match alpha_test {
+            Some(true) => Some(alpha_ref.unwrap_or(0)),
+            _ if output == 1 => Some(alpha_ref.unwrap_or(128)),
+            Some(false) => None,
+            None if has_opacity => None,
+            None => self.state.alpha_cutoff,
+        };
+        if self.state.alpha_cutoff.is_some() && !has_opacity && self.opacity.is_none() {
+            self.state.use_texture_alpha = true;
+        }
+        if self.state.blend == VisualBlend::Opaque && self.state.alpha_cutoff.is_none() {
+            // An opaque shader consumes only its diffuse graph's RGB. A
+            // Combiner mask in that graph is not surface transparency.
+            self.set_opacity(None);
+        }
+        self.state.depth_write = self.state.blend == VisualBlend::Opaque;
+    }
+
+    fn apply_polygon_flags(&mut self, flags: u32) {
+        if self.state.blend == VisualBlend::Invisible {
+            return;
+        }
+        if flags & PF_MASKED != 0 {
+            self.state.alpha_cutoff.get_or_insert(128);
+            self.state.use_texture_alpha = self.opacity.is_none();
+        }
+        if flags & PF_TRANSLUCENT != 0 {
+            self.state.blend = VisualBlend::Translucent;
+            self.state.depth_write = false;
+        } else if flags & PF_MODULATED != 0 {
+            self.state.blend = VisualBlend::Modulate;
+            self.state.depth_write = false;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -985,11 +1217,10 @@ fn exceeds_region_tile(mesh: &VisualMesh, transform: Transform) -> bool {
     (max.x - min.x).max(max.y - min.y) > MAX_SURFACE_SPAN
 }
 
-/// One draw batch of the textured visualization: every triangle sharing the
-/// same material texture (or the same absence of one), merged across every
-/// terrain tile, static mesh instance, and BSP surface that references it.
+/// A draw batch sharing complete material state. Blended surfaces remain
+/// independent so the renderer can sort them back-to-front.
 pub struct VisualBatch {
-    pub texture: Option<VisualTexture>,
+    pub material: VisualMaterial,
     pub vertices: Vec<(Vec3, Vec3, [f32; 2])>,
     pub indices: Vec<u32>,
 }
@@ -1006,27 +1237,50 @@ pub struct VisualScene {
 
 #[derive(Default)]
 struct VisualSceneBuilder {
-    // Keyed by the decoded texture's pixel buffer identity (`Rc::as_ptr`),
-    // so every material that shares the same underlying `Texture` export
-    // merges into one draw batch instead of one per surface. `None` groups
-    // every untextured surface (unsupported or unresolved material) into a
-    // single fallback batch.
-    slots: HashMap<Option<usize>, usize>,
-    batches: Vec<(Option<VisualTexture>, VisualMesh)>,
+    slots: HashMap<VisualMaterialKey, usize>,
+    batches: Vec<(VisualMaterial, VisualMesh)>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct VisualMaterialKey {
+    texture: Option<(usize, u32, u32)>,
+    opacity: Option<(usize, u32, u32)>,
+    state: VisualMaterialState,
+}
+
+impl VisualMaterialKey {
+    fn new(material: &VisualMaterial) -> Self {
+        let identity = |texture: &VisualTexture| {
+            (
+                Rc::as_ptr(&texture.rgba) as *const u8 as usize,
+                texture.width,
+                texture.height,
+            )
+        };
+        Self {
+            texture: material.texture.as_ref().map(identity),
+            opacity: material.opacity.as_ref().map(identity),
+            state: material.state,
+        }
+    }
 }
 impl VisualSceneBuilder {
-    fn add(&mut self, texture: Option<VisualTexture>, mesh: &VisualMesh, transform: Transform) {
-        if mesh.indices.is_empty() {
+    fn add(&mut self, material: VisualMaterial, mesh: &VisualMesh, transform: Transform) {
+        if mesh.indices.is_empty() || material.state.blend == VisualBlend::Invisible {
             return;
         }
-        let key = texture
-            .as_ref()
-            .map(|texture| Rc::as_ptr(&texture.rgba) as *const u8 as usize);
+        if material.state.blend != VisualBlend::Opaque {
+            let mut batch = VisualMesh::default();
+            batch.append(mesh, transform);
+            self.batches.push((material, batch));
+            return;
+        }
+        let key = VisualMaterialKey::new(&material);
         let index = match self.slots.get(&key) {
             Some(&index) => index,
             None => {
                 let index = self.batches.len();
-                self.batches.push((texture, VisualMesh::default()));
+                self.batches.push((material, VisualMesh::default()));
                 self.slots.insert(key, index);
                 index
             }
@@ -1038,8 +1292,8 @@ impl VisualSceneBuilder {
             batches: self
                 .batches
                 .into_iter()
-                .map(|(texture, mesh)| VisualBatch {
-                    texture,
+                .map(|(material, mesh)| VisualBatch {
+                    material,
                     vertices: mesh
                         .vertices
                         .into_iter()
@@ -1239,6 +1493,8 @@ struct Texture {
     format: u8,
     u_size: i32,
     v_size: i32,
+    masked: bool,
+    alpha_texture: bool,
     mips: Vec<Vec<u8>>,
     /// Top mip decoded to tightly packed RGBA8, for formats this reader can
     /// display (DXT1/DXT3/DXT5/RGBA8). `None` for the terrain heightmap
@@ -1248,6 +1504,32 @@ struct Texture {
     rgba: Option<Rc<[u8]>>,
 }
 impl Texture {
+    fn visual_texture(&self) -> Option<VisualTexture> {
+        self.rgba.clone().map(|rgba| VisualTexture {
+            width: self.u_size.max(0) as u32,
+            height: self.v_size.max(0) as u32,
+            rgba,
+        })
+    }
+
+    fn visual_material(&self) -> VisualMaterial {
+        VisualMaterial {
+            texture: self.visual_texture(),
+            opacity: None,
+            state: VisualMaterialState {
+                blend: if self.alpha_texture && !self.masked {
+                    VisualBlend::Alpha
+                } else {
+                    VisualBlend::Opaque
+                },
+                alpha_cutoff: self.masked.then_some(128),
+                use_texture_alpha: self.masked || self.alpha_texture,
+                depth_write: self.masked || !self.alpha_texture,
+                ..VisualMaterialState::default()
+            },
+        }
+    }
+
     fn read(archive: &Archive, reader: &mut Reader<'_>, flags: u32) -> Result<Self> {
         let props = read_properties(archive, reader, flags)?;
         let format = props.byte("Format").unwrap_or(0);
@@ -1285,6 +1567,8 @@ impl Texture {
             format,
             u_size,
             v_size,
+            masked: props.boolean("bMasked"),
+            alpha_texture: props.boolean("bAlphaTexture"),
             mips,
             rgba,
         })
@@ -1423,7 +1707,7 @@ fn decode_dxt(source: &[u8], width: usize, height: usize, kind: u8) -> Result<Ve
             };
             let c0 = u16::from_le_bytes([block[color_offset], block[color_offset + 1]]);
             let c1 = u16::from_le_bytes([block[color_offset + 2], block[color_offset + 3]]);
-            let palette = dxt_palette(c0, c1);
+            let palette = dxt_palette(c0, c1, kind != 1);
             let bits = u32::from_le_bytes([
                 block[color_offset + 4],
                 block[color_offset + 5],
@@ -1454,7 +1738,7 @@ fn decode_dxt(source: &[u8], width: usize, height: usize, kind: u8) -> Result<Ve
     Ok(output)
 }
 
-fn dxt_palette(c0: u16, c1: u16) -> [[u8; 3]; 4] {
+fn dxt_palette(c0: u16, c1: u16, four_color: bool) -> [[u8; 3]; 4] {
     let unpack = |color: u16| {
         [
             ((color >> 11 & 31) * 255 / 31) as u8,
@@ -1466,7 +1750,7 @@ fn dxt_palette(c0: u16, c1: u16) -> [[u8; 3]; 4] {
     let second = unpack(c1);
     let mut colors = [first, second, [0; 3], [0; 3]];
     for channel in 0..3 {
-        if c0 > c1 {
+        if four_color || c0 > c1 {
             colors[2][channel] = ((2 * first[channel] as u16 + second[channel] as u16) / 3) as u8;
             colors[3][channel] = ((first[channel] as u16 + 2 * second[channel] as u16) / 3) as u8;
         } else {
@@ -1864,19 +2148,17 @@ impl Model {
             Ok(Some(mesh))
         }
     }
-    /// Every visible (non-passable) surface's local-space textured mesh,
-    /// paired with the object index of its material. UV is in texel space
+    /// Every visible surface's local-space textured mesh, independent of
+    /// collision flags, paired with its material index and polygon flags.
+    /// UV is in texel space
     /// (not yet divided by the resolved texture's width/height, since that
     /// is only known once the caller resolves the material); the standard
     /// Unreal BSP mapping is `texel = dot(point - Base, TextureU/V)`, where
     /// `Base` is `points[base_index]` and `TextureU`/`TextureV` are
     /// `vectors[u_index]`/`vectors[v_index]`.
-    fn visual_surfaces(&self) -> Result<Vec<(Option<i32>, VisualMesh)>> {
+    fn visual_surfaces(&self) -> Result<Vec<(Option<i32>, u32, VisualMesh)>> {
         let mut result = Vec::new();
         for node in &self.nodes {
-            if node.flags & NF_PASSABLE != 0 {
-                continue;
-            }
             let surface = self
                 .surfaces
                 .get(
@@ -1884,7 +2166,8 @@ impl Model {
                         .map_err(|_| AppError::InvalidData("negative BSP surface index".into()))?,
                 )
                 .ok_or_else(|| AppError::InvalidData("BSP surface index out of bounds".into()))?;
-            if surface.polygon_flags & PF_PASSABLE != 0 {
+            // Sky portals show the SkyZone, not their own assigned bitmap.
+            if surface.polygon_flags & (PF_INVISIBLE | PF_PORTAL | PF_FAKE_BACKDROP) != 0 {
                 continue;
             }
             let start = usize::try_from(node.vertex_pool_index)
@@ -1950,7 +2233,7 @@ impl Model {
                 mesh.indices.extend([0, index as u32 - 1, index as u32]);
             }
             let material_index = (surface.material_index != 0).then_some(surface.material_index);
-            result.push((material_index, mesh));
+            result.push((material_index, surface.polygon_flags, mesh));
         }
         Ok(result)
     }
@@ -2627,6 +2910,526 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn material_properties(values: Vec<(&str, Value)>) -> Properties {
+        Properties(
+            values
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), vec![Property { value }]))
+                .collect(),
+        )
+    }
+
+    fn material_wrapper(class: &str, values: Vec<(&str, Value)>) -> Object {
+        Object::Material(MaterialWrapper::from_properties(
+            class,
+            &material_properties(values),
+        ))
+    }
+
+    fn material_texture(alpha: u8, masked: bool, alpha_texture: bool) -> Object {
+        Object::Texture(Texture {
+            format: 5,
+            u_size: 1,
+            v_size: 1,
+            masked,
+            alpha_texture,
+            mips: Vec::new(),
+            rgba: Some(Rc::from([80, 120, 160, alpha])),
+        })
+    }
+
+    fn material_archive(
+        loader: &PackageLoader,
+        name: &str,
+        entries: Vec<(&str, &str, Object)>,
+        imports: Vec<Import>,
+    ) -> Rc<Archive> {
+        let (exports, objects) = entries
+            .into_iter()
+            .map(|(name, class, object)| {
+                (
+                    Export {
+                        class_name: class.to_owned(),
+                        object_name: name.to_owned(),
+                        flags: 0,
+                        serial_size: 0,
+                        serial_offset: 0,
+                    },
+                    Some(Rc::new(object)),
+                )
+            })
+            .unzip();
+        let archive = Rc::new(Archive {
+            name: name.to_owned(),
+            data: Vec::new(),
+            header: Header {
+                file_version: 0,
+                license_version: 0,
+            },
+            names: Vec::new(),
+            imports,
+            exports,
+            objects: RefCell::new(objects),
+        });
+        loader
+            .archives
+            .borrow_mut()
+            .insert(name.to_owned(), Rc::clone(&archive));
+        archive
+    }
+
+    #[test]
+    fn opaque_shader_ignores_diffuse_specularity_alpha() {
+        let loader = PackageLoader::new(PathBuf::new(), 0, false);
+        let archive = material_archive(
+            &loader,
+            "Floor",
+            vec![
+                ("Pixels", "Texture", material_texture(0, false, false)),
+                ("Mask", "Texture", material_texture(20, false, false)),
+                (
+                    "Diffuse",
+                    "Combiner",
+                    material_wrapper(
+                        "Combiner",
+                        vec![("Material1", Value::Index(1)), ("Mask", Value::Index(2))],
+                    ),
+                ),
+                (
+                    "Floor",
+                    "Shader",
+                    material_wrapper(
+                        "Shader",
+                        vec![
+                            ("Diffuse", Value::Index(3)),
+                            ("SpecularityMask", Value::Index(1)),
+                        ],
+                    ),
+                ),
+            ],
+            Vec::new(),
+        );
+        let material = loader.visual_material_ref(&archive, 4).unwrap();
+        assert_eq!(material.state, VisualMaterialState::default());
+        assert_eq!(
+            &*material.texture.as_ref().unwrap().rgba,
+            &[80, 120, 160, 0]
+        );
+        assert!(material.opacity.is_none());
+    }
+
+    #[test]
+    fn shader_opacity_uses_owning_archive_and_overrides_diffuse_mask() {
+        let loader = PackageLoader::new(PathBuf::new(), 0, false);
+        material_archive(
+            &loader,
+            "Alpha",
+            vec![("Opacity", "Texture", material_texture(200, false, false))],
+            Vec::new(),
+        );
+        material_archive(
+            &loader,
+            "Materials",
+            vec![
+                ("Diffuse", "Texture", material_texture(0, true, false)),
+                (
+                    "Shader",
+                    "Shader",
+                    material_wrapper(
+                        "Shader",
+                        vec![("Diffuse", Value::Index(1)), ("Opacity", Value::Index(-2))],
+                    ),
+                ),
+            ],
+            vec![
+                Import {
+                    class_name: "Package".into(),
+                    package_index: 0,
+                    object_name: "Alpha".into(),
+                },
+                Import {
+                    class_name: "Texture".into(),
+                    package_index: -1,
+                    object_name: "Opacity".into(),
+                },
+            ],
+        );
+        let map = material_archive(
+            &loader,
+            "Map",
+            Vec::new(),
+            vec![
+                Import {
+                    class_name: "Package".into(),
+                    package_index: 0,
+                    object_name: "Materials".into(),
+                },
+                Import {
+                    class_name: "Shader".into(),
+                    package_index: -1,
+                    object_name: "Shader".into(),
+                },
+            ],
+        );
+        let material = loader.visual_material_ref(&map, -2).unwrap();
+        assert_eq!(material.texture.as_ref().unwrap().rgba[3], 0);
+        assert_eq!(material.opacity.as_ref().unwrap().rgba[3], 200);
+        assert_eq!(material.state.blend, VisualBlend::Alpha);
+        assert_eq!(material.state.alpha_cutoff, None);
+        assert!(!material.state.use_texture_alpha);
+        assert!(!material.state.depth_write);
+    }
+
+    #[test]
+    fn authored_mask_and_final_blend_overrides_survive_modifiers() {
+        let loader = PackageLoader::new(PathBuf::new(), 0, false);
+        let archive = material_archive(
+            &loader,
+            "Masks",
+            vec![
+                ("Pixels", "Texture", material_texture(21, false, false)),
+                (
+                    "Mask",
+                    "Shader",
+                    material_wrapper(
+                        "Shader",
+                        vec![
+                            ("Diffuse", Value::Index(1)),
+                            ("Opacity", Value::Index(1)),
+                            ("OutputBlending", Value::Byte(1)),
+                            ("AlphaTest", Value::Bool(true)),
+                            ("AlphaRef", Value::Byte(20)),
+                        ],
+                    ),
+                ),
+                (
+                    "Pan",
+                    "TexPanner",
+                    material_wrapper("TexPanner", vec![("Material", Value::Index(2))]),
+                ),
+                (
+                    "Overwrite",
+                    "FinalBlend",
+                    material_wrapper(
+                        "FinalBlend",
+                        vec![
+                            ("Material", Value::Index(3)),
+                            ("AlphaTest", Value::Bool(false)),
+                        ],
+                    ),
+                ),
+                (
+                    "Alpha",
+                    "FinalBlend",
+                    material_wrapper(
+                        "FinalBlend",
+                        vec![
+                            ("Material", Value::Index(3)),
+                            ("FrameBufferBlending", Value::Byte(2)),
+                            ("AlphaTest", Value::Bool(true)),
+                            ("AlphaRef", Value::Byte(1)),
+                            ("ZWrite", Value::Bool(false)),
+                            ("ZTest", Value::Bool(false)),
+                        ],
+                    ),
+                ),
+            ],
+            Vec::new(),
+        );
+        let mask = loader.visual_material_ref(&archive, 3).unwrap();
+        assert_eq!(mask.state.alpha_cutoff, Some(20));
+        assert_eq!(mask.state.blend, VisualBlend::Opaque);
+        assert!(mask.state.use_texture_alpha);
+        assert!(mask.opacity.is_none());
+        let overwrite = loader.visual_material_ref(&archive, 4).unwrap();
+        assert_eq!(overwrite.state, VisualMaterialState::default());
+        let alpha = loader.visual_material_ref(&archive, 5).unwrap();
+        assert_eq!(
+            alpha.state,
+            VisualMaterialState {
+                blend: VisualBlend::Alpha,
+                alpha_cutoff: Some(1),
+                use_texture_alpha: true,
+                depth_write: false,
+                depth_test: false,
+            }
+        );
+    }
+
+    #[test]
+    fn texture_flags_enable_mask_or_alpha_without_guessing_from_pixels() {
+        let Object::Texture(mut texture) = material_texture(0, false, false) else {
+            unreachable!()
+        };
+        assert_eq!(
+            texture.visual_material().state,
+            VisualMaterialState::default()
+        );
+        texture.alpha_texture = true;
+        let alpha = texture.visual_material();
+        assert_eq!(alpha.state.blend, VisualBlend::Alpha);
+        assert!(alpha.state.use_texture_alpha);
+        assert!(!alpha.state.depth_write);
+        texture.masked = true;
+        let masked = texture.visual_material();
+        assert_eq!(masked.state.blend, VisualBlend::Opaque);
+        assert_eq!(masked.state.alpha_cutoff, Some(128));
+        assert!(masked.state.depth_write);
+    }
+
+    #[test]
+    fn combiner_alpha_selection_is_independent_of_color_input() {
+        let loader = PackageLoader::new(PathBuf::new(), 0, false);
+        let archive = material_archive(
+            &loader,
+            "Combiners",
+            vec![
+                ("Color", "Texture", material_texture(10, false, false)),
+                ("Mask", "Texture", material_texture(200, false, false)),
+                (
+                    "Combined",
+                    "Combiner",
+                    material_wrapper(
+                        "Combiner",
+                        vec![
+                            ("Material1", Value::Index(1)),
+                            ("Material2", Value::Index(2)),
+                            ("Mask", Value::Index(2)),
+                        ],
+                    ),
+                ),
+                (
+                    "Shader",
+                    "Shader",
+                    material_wrapper(
+                        "Shader",
+                        vec![
+                            ("Diffuse", Value::Index(1)),
+                            ("Opacity", Value::Index(3)),
+                            ("OutputBlending", Value::Byte(1)),
+                        ],
+                    ),
+                ),
+                (
+                    "NoMask",
+                    "Combiner",
+                    material_wrapper(
+                        "Combiner",
+                        vec![
+                            ("Material1", Value::Index(1)),
+                            ("Material2", Value::Index(2)),
+                        ],
+                    ),
+                ),
+            ],
+            Vec::new(),
+        );
+        let material = loader.visual_material_ref(&archive, 4).unwrap();
+        assert_eq!(material.texture.as_ref().unwrap().rgba[3], 10);
+        assert_eq!(material.opacity.as_ref().unwrap().rgba[3], 200);
+        assert_eq!(material.state.alpha_cutoff, Some(128));
+        assert!(!material.state.use_texture_alpha);
+        assert!(loader.visual_opacity_at(&archive, 5, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn material_graph_cycles_are_bounded_on_diffuse_and_opacity_edges() {
+        let loader = PackageLoader::new(PathBuf::new(), 0, false);
+        let archive = material_archive(
+            &loader,
+            "Cycles",
+            vec![
+                (
+                    "Loop",
+                    "Modifier",
+                    material_wrapper("Modifier", vec![("Material", Value::Index(1))]),
+                ),
+                (
+                    "Shader",
+                    "Shader",
+                    material_wrapper(
+                        "Shader",
+                        vec![("Diffuse", Value::Index(1)), ("Opacity", Value::Index(2))],
+                    ),
+                ),
+            ],
+            Vec::new(),
+        );
+        let material = loader.visual_material_ref(&archive, 2).unwrap();
+        assert!(material.texture.is_none());
+        assert!(material.opacity.is_none());
+        assert!(!material.state.use_texture_alpha);
+    }
+
+    #[test]
+    fn material_batches_preserve_distinct_masks_and_sortable_blended_surfaces() {
+        let Object::Texture(texture) = material_texture(32, true, false) else {
+            unreachable!()
+        };
+        let mut first = texture.visual_material();
+        first.state.alpha_cutoff = Some(20);
+        let mut second = first.clone();
+        second.state.alpha_cutoff = Some(64);
+        let mesh = VisualMesh {
+            vertices: vec![
+                VisualVertex {
+                    position: Vec3::default(),
+                    normal: Vec3::new(0.0, 0.0, 1.0),
+                    uv: [0.0; 2],
+                },
+                VisualVertex {
+                    position: Vec3::new(1.0, 0.0, 0.0),
+                    normal: Vec3::new(0.0, 0.0, 1.0),
+                    uv: [0.0; 2],
+                },
+                VisualVertex {
+                    position: Vec3::new(0.0, 1.0, 0.0),
+                    normal: Vec3::new(0.0, 0.0, 1.0),
+                    uv: [0.0; 2],
+                },
+            ],
+            indices: vec![0, 1, 2],
+        };
+        let mut builder = VisualSceneBuilder::default();
+        builder.add(first.clone(), &mesh, Transform::default());
+        builder.add(second, &mesh, Transform::default());
+        builder.add(first.clone(), &mesh, Transform::default());
+        let mut separate_alpha = first.clone();
+        separate_alpha.set_opacity(Some(VisualTexture {
+            width: 1,
+            height: 1,
+            rgba: Rc::from([255, 255, 255, 180]),
+        }));
+        builder.add(separate_alpha, &mesh, Transform::default());
+        first.state.blend = VisualBlend::Alpha;
+        first.state.depth_write = false;
+        builder.add(first.clone(), &mesh, Transform::default());
+        builder.add(first, &mesh, Transform::default());
+        let scene = builder.finish();
+        assert_eq!(scene.batches.len(), 5);
+        assert_eq!(scene.batches[0].indices.len(), 6);
+        assert_eq!(scene.batches[1].material.state.alpha_cutoff, Some(64));
+        assert_eq!(
+            scene.batches[2].material.opacity.as_ref().unwrap().rgba[3],
+            180
+        );
+        assert_eq!(scene.batches[3].indices.len(), 3);
+        assert_eq!(scene.batches[4].indices.len(), 3);
+    }
+
+    #[test]
+    fn bsp_flags_keep_authored_cutoff_and_select_rgb_blending() {
+        let mut material = VisualMaterial::default();
+        material.state.alpha_cutoff = Some(20);
+        material.apply_polygon_flags(PF_MASKED | PF_TRANSLUCENT);
+        assert_eq!(material.state.alpha_cutoff, Some(20));
+        assert_eq!(material.state.blend, VisualBlend::Translucent);
+        assert!(material.state.use_texture_alpha);
+        assert!(!material.state.depth_write);
+        material.apply_polygon_flags(PF_MODULATED);
+        assert_eq!(material.state.blend, VisualBlend::Modulate);
+        material.state.blend = VisualBlend::Invisible;
+        material.apply_polygon_flags(PF_TRANSLUCENT);
+        assert_eq!(material.state.blend, VisualBlend::Invisible);
+    }
+
+    #[test]
+    fn dxt3_and_dxt5_keep_four_colors_with_ascending_endpoints() {
+        let color = [0, 0, 255, 255, 255, 255, 255, 255];
+        let mut dxt3 = vec![255; 8];
+        dxt3.extend(color);
+        let mut dxt5 = vec![255, 0, 0, 0, 0, 0, 0, 0];
+        dxt5.extend(color);
+        assert_eq!(
+            &decode_dxt(&dxt3, 4, 4, 3).unwrap()[..4],
+            &[170, 170, 170, 255]
+        );
+        assert_eq!(
+            &decode_dxt(&dxt5, 4, 4, 5).unwrap()[..4],
+            &[170, 170, 170, 255]
+        );
+        assert_eq!(&decode_dxt(&color, 4, 4, 1).unwrap()[..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    #[ignore = "requires GEODATA_EDITOR_CLIENT pointing to a local real Lineage II client"]
+    fn resolves_real_giran_material_alpha_semantics() {
+        let client = std::env::var("GEODATA_EDITOR_CLIENT").expect("set GEODATA_EDITOR_CLIENT");
+        let loader = PackageLoader::new(PathBuf::from(client), 0, false);
+        let archive = loader.archive("Giran_Village_T").unwrap();
+        for (name, cutoff) in [
+            ("Giran_Square_BT_02_sh", None),
+            ("Giran_Church_T_03_SH", Some(128)),
+            ("Giran_in_StatueStand_05_SH", Some(20)),
+        ] {
+            let index = archive
+                .exports
+                .iter()
+                .position(|export| export.object_name == name)
+                .unwrap();
+            let material = loader
+                .visual_material_ref(&archive, index as i32 + 1)
+                .unwrap();
+            assert_eq!(material.state.blend, VisualBlend::Opaque, "{name}");
+            assert_eq!(material.state.alpha_cutoff, cutoff, "{name}");
+            assert_eq!(material.state.use_texture_alpha, cutoff.is_some(), "{name}");
+            assert!(material.opacity.is_none(), "{name}");
+            assert!(material.texture.is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn non_solid_bsp_floor_still_has_visual_geometry() {
+        let mut model = Model {
+            vectors: vec![
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+            points: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(64.0, 0.0, 0.0),
+                Vec3::new(0.0, 64.0, 0.0),
+            ],
+            nodes: vec![BspNode {
+                flags: NF_PASSABLE,
+                vertex_pool_index: 0,
+                surface_index: 0,
+                vertex_count: 3,
+            }],
+            surfaces: vec![BspSurface {
+                material_index: 1,
+                polygon_flags: 0x0000_0008,
+                base_index: 0,
+                normal_index: 0,
+                u_index: 1,
+                v_index: 2,
+            }],
+            vertices: (0..3)
+                .map(|vertex_index| BspVertex { vertex_index })
+                .collect(),
+        };
+        assert!(model.mesh(None).unwrap().is_none());
+        let surfaces = model.visual_surfaces().unwrap();
+        assert_eq!(
+            surfaces
+                .iter()
+                .map(|(_, _, mesh)| mesh.indices.len())
+                .sum::<usize>(),
+            3
+        );
+        assert_eq!(surfaces[0].2.vertices[1].uv, [64.0, 0.0]);
+        assert_eq!(surfaces[0].2.vertices[1].normal, Vec3::new(0.0, 0.0, 1.0));
+        model.nodes[0].flags = 0;
+        assert!(model.mesh(None).unwrap().is_none());
+        model.surfaces[0].polygon_flags |= PF_INVISIBLE;
+        assert!(model.visual_surfaces().unwrap().is_empty());
+        model.surfaces[0].polygon_flags = PF_PORTAL;
+        assert!(model.visual_surfaces().unwrap().is_empty());
+        model.surfaces[0].polygon_flags = PF_FAKE_BACKDROP;
+        assert!(model.visual_surfaces().unwrap().is_empty());
+    }
     #[test]
     fn reads_compact_indices() {
         let mut reader = Reader::new(&[0x3f, 0x41, 0x01, 0xc1, 0x01], 0);
@@ -2751,7 +3554,7 @@ mod tests {
         let textured: usize = scene
             .batches
             .iter()
-            .filter(|batch| batch.texture.is_some())
+            .filter(|batch| batch.material.texture.is_some())
             .map(|batch| batch.indices.len())
             .sum();
         let total: usize = scene.batches.iter().map(|batch| batch.indices.len()).sum();
