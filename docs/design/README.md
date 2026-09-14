@@ -32,6 +32,10 @@ No operating-system fonts or additional runtime assets are required.
 `src/editor_chrome.rs` owns the theme, 24-unit vector icon paths, vector NSWE
 compasses and empty-state artwork. Icons are drawn directly through the egui
 painter; the generated bitmap is a design reference, not an application skin.
+Toolbar strokes have a 1.5-point minimum to retain coverage at small sizes.
+Curved icons use Bézier paths, and closed contours use joined seams rather than
+overlapping end caps. These paths scale with egui's DPI, including fractional
+desktop scales; no raster icon cache or additional scene multisampling is needed.
 Existing in-world NSWE textures retain their original rendering and bit mapping.
 
 `src/editor_view.rs` connects the menus, toolbar, viewport switches and inspector
@@ -39,6 +43,8 @@ to the existing project and editing actions. Folder and file paths truncate
 inside their fields and expose the full value on hover. The inspector resizes
 and scrolls; viewport controls scroll horizontally when space is constrained.
 Empty-project editing controls are disabled. The light theme remains available.
+Project actions use the regular neutral button style, with hover and keyboard
+focus feedback. Selected-button styling is reserved for persistent toggle states.
 
 Project decoding, collision buffers, initial overlays and textured resources are
 prepared in `src/editor_view/loading.rs` on a worker thread. The current scene

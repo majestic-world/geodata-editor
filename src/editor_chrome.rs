@@ -159,16 +159,21 @@ pub(super) enum Icon {
     Compass,
 }
 
-/// Paths use a 24-unit viewbox, matching the Higgsfield concept's line icons.
+/// Vector paths share a 24-unit viewbox and remain legible at toolbar sizes.
 pub(super) fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     let point =
         |x: f32, y: f32| rect.min + egui::vec2(x / 24.0 * rect.width(), y / 24.0 * rect.height());
-    let stroke = Stroke::new((rect.width() / 24.0 * 1.5).clamp(1.0, 2.0), color);
+    let stroke = Stroke::new((rect.width() / 24.0 * 2.0).clamp(1.5, 3.0), color);
     let path = |points: &[[f32; 2]]| {
-        painter.add(egui::Shape::line(
-            points.iter().map(|p| point(p[0], p[1])).collect(),
-            stroke,
-        ));
+        // Closing the path joins its seam instead of overlapping two end caps.
+        let closed = points.first() == points.last();
+        let end = points.len() - usize::from(closed);
+        let points = points[..end].iter().map(|p| point(p[0], p[1])).collect();
+        painter.add(if closed {
+            egui::Shape::closed_line(points, stroke)
+        } else {
+            egui::Shape::line(points, stroke)
+        });
     };
     match icon {
         Icon::Folder => {
@@ -205,13 +210,18 @@ pub(super) fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color:
             };
             let points = [[8., 5.], [3., 10.], [8., 15.]];
             path(&points.map(|[x, y]| [flip(x), y]));
-            path(&[
-                [flip(3.), 10.],
-                [flip(15.), 10.],
-                [flip(20.), 13.],
-                [flip(20.), 18.],
-                [flip(17.), 21.],
-            ]);
+            path(&[[flip(3.), 10.], [flip(14.), 10.]]);
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                [
+                    point(flip(14.), 10.),
+                    point(flip(23.), 10.),
+                    point(flip(23.), 21.),
+                    point(flip(14.), 21.),
+                ],
+                false,
+                Color32::TRANSPARENT,
+                stroke,
+            ));
         }
         Icon::Layers => {
             path(&[[2., 8.], [12., 3.], [22., 8.], [12., 13.], [2., 8.]]);
@@ -227,9 +237,8 @@ pub(super) fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color:
                 [12., 22.],
                 [3., 17.],
                 [3., 7.],
-                [12., 12.],
-                [21., 7.],
             ]);
+            path(&[[3., 7.], [12., 12.], [21., 7.]]);
             path(&[[12., 12.], [12., 22.]]);
         }
         Icon::Grid => {
@@ -244,17 +253,14 @@ pub(super) fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color:
             }
         }
         Icon::Eye => {
-            path(&[
-                [2., 12.],
-                [7., 7.],
-                [12., 5.],
-                [17., 7.],
-                [22., 12.],
-                [17., 17.],
-                [12., 19.],
-                [7., 17.],
-                [2., 12.],
-            ]);
+            for control_y in [-1., 25.] {
+                painter.add(egui::epaint::QuadraticBezierShape::from_points_stroke(
+                    [point(2., 12.), point(12., control_y), point(22., 12.)],
+                    false,
+                    Color32::TRANSPARENT,
+                    stroke,
+                ));
+            }
             painter.circle_stroke(point(12., 12.), rect.width() / 7., stroke);
         }
         Icon::Sun => {
@@ -325,28 +331,6 @@ pub(super) fn toggle(ui: &mut Ui, icon: Icon, label: &str, value: &mut bool) -> 
     response
 }
 
-pub(super) fn primary_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
-    ui.scope(|ui| {
-        let dark = ui.visuals().dark_mode;
-        ui.visuals_mut().selection.bg_fill = if dark {
-            accent(EditorTheme::Dark)
-        } else {
-            Color32::from_rgb(27, 105, 194)
-        };
-        ui.visuals_mut().selection.stroke = Stroke::new(
-            1.0_f32,
-            if dark {
-                Color32::WHITE
-            } else {
-                Color32::from_rgb(86, 165, 255)
-            },
-        );
-        ui.visuals_mut().widgets.active.fg_stroke.color = Color32::WHITE;
-        icon_button(ui, icon, label, true)
-    })
-    .inner
-}
-
 /// The same NSWE bit mapping as the document and world overlay. Open arrows
 /// are outlined; blocked directions have a crossbar as well as a muted color.
 pub(super) fn paint_nswe(
@@ -370,15 +354,16 @@ pub(super) fn paint_nswe(
         let normal = egui::vec2(-axis.y, axis.x);
         let tip = center + axis * unit * 0.84;
         let base = center + axis * unit * 0.42;
-        painter.line_segment([base - normal * unit * 0.22, tip], stroke);
-        painter.line_segment([base + normal * unit * 0.22, tip], stroke);
+        let head = vec![
+            base - normal * unit * 0.22,
+            tip,
+            base + normal * unit * 0.22,
+        ];
         if allowed {
+            painter.add(egui::Shape::line(head, stroke));
             painter.line_segment([center + axis * unit * 0.22, tip], stroke);
         } else {
-            painter.line_segment(
-                [base - normal * unit * 0.22, base + normal * unit * 0.22],
-                stroke,
-            );
+            painter.add(egui::Shape::closed_line(head, stroke));
         }
     }
     painter.rect_stroke(
@@ -441,7 +426,7 @@ pub(super) fn empty_viewport(ui: &mut Ui, theme: EditorTheme) -> bool {
                     .small(),
             );
             ui.add_space(19.);
-            clicked = primary_button(ui, Icon::Folder, "Abrir projeto").clicked();
+            clicked = icon_button(ui, Icon::Folder, "Abrir projeto", false).clicked();
         });
     });
     painter.text(

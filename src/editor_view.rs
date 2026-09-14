@@ -1545,7 +1545,7 @@ impl EditorView {
             }
         }
         ui.add_space(6.0);
-        if chrome::primary_button(ui, Icon::Layers, "Carregar projeto").clicked() {
+        if chrome::icon_button(ui, Icon::Layers, "Carregar projeto", false).clicked() {
             *action = EditorAction::OpenProject;
         }
         ui.label(
