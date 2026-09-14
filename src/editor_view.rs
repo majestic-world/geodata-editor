@@ -21,6 +21,7 @@ use winit::{
 
 use crate::{
     editor::{self, EditorMemory, EditorOptions, EditorTheme, MapType},
+    editor_chrome::{self as chrome, Icon},
     error::{AppError, Result},
     geometry::{Box3, Triangle, Vec3},
     l2j::{self, Direction, Document, EditableBlockType, Layer, LayerAddress, NULL_HEIGHT},
@@ -614,12 +615,11 @@ struct EditorView {
     has_context: bool,
     package_count: usize,
     max_layer_count: usize,
+    /// Logical viewport bounds; rendering and picking use the same rectangle.
+    viewport: egui::Rect,
     ui: EditorUi,
     geodata_mesh: GeodataInstances,
     nswe_icon_mesh: NsweIconInstances,
-    /// One icon for every NSWE mask. They are embedded in the executable, so
-    /// the distributed editor keeps working without an adjacent data folder.
-    nswe_icons: [egui::TextureHandle; 16],
     /// Cached GPU form of the textured visualization, built lazily the
     /// first time `ui.textured_view` is enabled for the current project.
     textured_scene: Option<TexturedScene>,
@@ -802,22 +802,6 @@ fn editor_active_selection_count(ui: &EditorUi) -> usize {
     }
 }
 
-fn load_nswe_icons(context: &egui::Context) -> [egui::TextureHandle; 16] {
-    std::array::from_fn(|mask| {
-        let pixels = decode_nswe_icon(nswe_icon_bytes(mask as u8));
-        context.load_texture(
-            format!("geodata-editor-nswe-{mask}"),
-            pixels,
-            egui::TextureOptions::LINEAR,
-        )
-    })
-}
-
-fn decode_nswe_icon(bytes: &[u8]) -> egui::ColorImage {
-    let (size, rgba) = decode_nswe_icon_rgba(bytes);
-    egui::ColorImage::from_rgba_unmultiplied(size, &rgba)
-}
-
 fn decode_nswe_icon_rgba(bytes: &[u8]) -> ([usize; 2], Vec<u8>) {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -940,7 +924,6 @@ impl EditorView {
                 &selection_lookup,
             ),
         );
-        let nswe_icons = load_nswe_icons(&preview.egui_context);
         let view = Self {
             preview,
             document,
@@ -948,10 +931,10 @@ impl EditorView {
             has_context: loaded,
             package_count,
             max_layer_count,
+            viewport: egui::Rect::NOTHING,
             ui,
             geodata_mesh,
             nswe_icon_mesh,
-            nswe_icons,
             textured_scene: None,
         };
         if view.loaded && view.has_context {
@@ -1098,6 +1081,22 @@ impl EditorView {
             .take_egui_input(self.preview.window.as_ref());
         let context = self.preview.egui_context.clone();
         let full_output = context.run(raw_input, |context| self.draw_ui(context));
+        let viewport = viewport_pixels(
+            self.viewport,
+            self.preview.window.scale_factor() as f32,
+            [self.preview.config.width, self.preview.config.height],
+        );
+        let uniform = CameraUniform::new(
+            self.preview
+                .camera
+                .matrix(viewport.width() as u32, viewport.height() as u32),
+            self.preview.camera.position,
+        );
+        self.preview.queue.write_buffer(
+            &self.preview.camera_buffer,
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
         self.preview
             .egui_state
             .handle_platform_output(self.preview.window.as_ref(), full_output.platform_output);
@@ -1151,6 +1150,14 @@ impl EditorView {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            pass.set_viewport(
+                viewport.left(),
+                viewport.top(),
+                viewport.width(),
+                viewport.height(),
+                0.0,
+                1.0,
+            );
             if self.has_context {
                 match (self.ui.textured_view, &self.textured_scene) {
                     (true, Some(scene)) => {
@@ -1198,6 +1205,14 @@ impl EditorView {
                     );
                 }
             }
+            pass.set_viewport(
+                0.0,
+                0.0,
+                self.preview.config.width as f32,
+                self.preview.config.height as f32,
+                0.0,
+                1.0,
+            );
             self.preview
                 .egui_renderer
                 .render(&mut pass, &paint_jobs, &screen);
@@ -1217,29 +1232,185 @@ impl EditorView {
     fn draw_ui(&mut self, context: &egui::Context) {
         let mut action = EditorAction::None;
         let mut visual_changed = false;
+        egui::TopBottomPanel::top("editor_menubar")
+            .exact_height(30.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(theme_extreme_bg(self.ui.theme))
+                    .inner_margin(egui::Margin::symmetric(12.0, 2.0)),
+            )
+            .show(context, |ui| self.draw_editor_menu(ui, &mut action));
         egui::TopBottomPanel::top("editor_toolbar")
-            .exact_height(38.0)
+            .exact_height(46.0)
             .show(context, |ui| self.draw_editor_toolbar(ui, &mut action));
         egui::TopBottomPanel::bottom("editor_status")
-            .exact_height(82.0)
+            .exact_height(56.0)
             .show(context, |ui| self.draw_editor_status(ui));
         egui::SidePanel::right("editor_inspector")
-            .default_width(348.0)
-            .min_width(300.0)
+            .default_width(352.0)
+            .min_width(320.0)
             .max_width(480.0)
             .resizable(true)
+            .frame(
+                egui::Frame::side_top_panel(&context.style())
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0)),
+            )
             .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                    chrome::paint_icon(
+                        ui.painter(),
+                        rect,
+                        Icon::Layers,
+                        theme_accent(self.ui.theme),
+                    );
+                    ui.label(egui::RichText::new("Detalhes").strong());
+                });
+                let line = ui.available_rect_before_wrap();
+                ui.painter().line_segment(
+                    [line.left_top(), line.left_top() + egui::vec2(88.0, 0.0)],
+                    egui::Stroke::new(2.0_f32, theme_accent(self.ui.theme)),
+                );
+                ui.add_space(8.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.draw_editor_inspector(ui, &mut action, &mut visual_changed);
+                        self.draw_editor_inspector(ui, &mut action, &mut visual_changed)
                     });
             });
+        egui::TopBottomPanel::top("editor_viewport_toolbar")
+            .exact_height(36.0)
+            .show(context, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_source("viewport_controls")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            chrome::paint_icon(
+                                ui.painter(),
+                                rect,
+                                Icon::Cube,
+                                ui.visuals().text_color(),
+                            );
+                            ui.label("Perspectiva");
+                            ui.separator();
+                            chrome::toggle(
+                                ui,
+                                Icon::Cube,
+                                "Wireframe",
+                                &mut self.preview.ui.wireframe,
+                            )
+                            .on_hover_text("Exibir as arestas da geometria");
+                            chrome::toggle(ui, Icon::Eye, "Culling", &mut self.preview.ui.culling)
+                                .on_hover_text("Ocultar faces voltadas para trás");
+                            chrome::toggle(ui, Icon::Compass, "NSWE", &mut self.ui.show_nswe_icons)
+                                .on_hover_text("Exibir direções de passagem nas células");
+                            if chrome::toggle(ui, Icon::Grid, "Textura", &mut self.ui.textured_view)
+                                .changed()
+                                && self.ui.textured_view
+                                && self.textured_scene.is_none()
+                            {
+                                self.enable_textured_view();
+                            }
+                        });
+                    });
+            });
+        self.viewport = context.available_rect();
+        if !self.loaded {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(context, |ui| {
+                    if chrome::empty_viewport(ui, self.ui.theme) {
+                        action = EditorAction::OpenProject;
+                    }
+                });
+        }
         self.draw_flavour_prompt(context, &mut action);
         self.apply(action);
         if visual_changed && self.loaded && self.has_context {
             self.refresh_editor_meshes();
         }
+    }
+
+    fn draw_editor_menu(&mut self, ui: &mut egui::Ui, action: &mut EditorAction) {
+        egui::menu::bar(ui, |ui| {
+            ui.label(
+                egui::RichText::new("GE")
+                    .strong()
+                    .color(theme_accent(self.ui.theme)),
+            );
+            ui.separator();
+            ui.menu_button("Projeto", |ui| {
+                if ui.button("Abrir projeto     Ctrl+O").clicked() {
+                    *action = EditorAction::OpenProject;
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(
+                        self.loaded,
+                        egui::Button::new("Salvar               Ctrl+S"),
+                    )
+                    .clicked()
+                {
+                    *action = EditorAction::Save;
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Edição", |ui| {
+                if ui
+                    .add_enabled(self.loaded, egui::Button::new("Desfazer     Ctrl+Z"))
+                    .clicked()
+                {
+                    *action = EditorAction::Undo;
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(self.loaded, egui::Button::new("Refazer       Ctrl+Y"))
+                    .clicked()
+                {
+                    *action = EditorAction::Redo;
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Visualização", |ui| {
+                ui.checkbox(&mut self.preview.ui.wireframe, "Wireframe");
+                ui.checkbox(&mut self.preview.ui.culling, "Culling");
+                ui.checkbox(&mut self.ui.show_nswe_icons, "Direções NSWE");
+                if ui
+                    .checkbox(&mut self.ui.textured_view, "Texturas do cliente")
+                    .changed()
+                    && self.ui.textured_view
+                    && self.textured_scene.is_none()
+                {
+                    self.enable_textured_view();
+                }
+            });
+            ui.menu_button("Ajuda", |ui| {
+                ui.set_max_width(340.0);
+                ui.label(egui::RichText::new("Navegação no mapa").strong());
+                ui.label("W A S D · mover / Q E · descer e subir");
+                ui.label("Botão direito + arrastar · olhar");
+                ui.label("Roda do mouse · aproximar / Shift · acelerar");
+                ui.label("Home · restaurar câmera");
+                ui.separator();
+                ui.label("Clique · selecionar / Shift · adicionar");
+                ui.label("Ctrl · seguir faixa / Esc · limpar seleção");
+                ui.separator();
+                ui.small(concat!(
+                    "Geodata Editor by Mk · v",
+                    env!("CARGO_PKG_VERSION")
+                ));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("GEODATA EDITOR  /  LINEAGE II")
+                        .small()
+                        .weak(),
+                );
+            });
+        });
     }
 
     /// In-app confirmation for the missing map flavour.
@@ -1283,62 +1454,56 @@ impl EditorView {
 
     fn draw_editor_toolbar(&mut self, ui: &mut egui::Ui, action: &mut EditorAction) {
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(7.0, 0.0);
-            ui.add_sized(
-                [138.0, 24.0],
-                egui::Label::new(
-                    egui::RichText::new("GEODATA EDITOR")
-                        .strong()
-                        .color(theme_accent(self.ui.theme)),
-                ),
-            );
-            ui.separator();
-            toolbar_section_label(ui, "PROJETO", theme_accent(self.ui.theme));
-            if ui.button("Abrir projeto").clicked() {
+            if chrome::icon_button(ui, Icon::Folder, "Abrir projeto", false)
+                .on_hover_text("Abrir projeto · Ctrl+O")
+                .clicked()
+            {
                 *action = EditorAction::OpenProject;
             }
-            if ui
-                .add_enabled(self.loaded, egui::Button::new("Salvar"))
-                .clicked()
-            {
-                *action = EditorAction::Save;
-            }
-            ui.separator();
-            toolbar_section_label(ui, "EDIÇÃO", theme_accent(self.ui.theme));
-            if ui
-                .add_enabled(self.loaded, egui::Button::new("Desfazer"))
-                .clicked()
-            {
-                *action = EditorAction::Undo;
-            }
-            if ui
-                .add_enabled(self.loaded, egui::Button::new("Refazer"))
-                .clicked()
-            {
-                *action = EditorAction::Redo;
-            }
-            ui.separator();
-            toolbar_section_label(ui, "VISUALIZAÇÃO", theme_accent(self.ui.theme));
-            ui.checkbox(&mut self.preview.ui.wireframe, "Wireframe");
-            ui.checkbox(&mut self.preview.ui.culling, "Culling");
-            ui.checkbox(&mut self.ui.show_nswe_icons, "NSWE");
-            if ui.checkbox(&mut self.ui.textured_view, "Textura").changed()
-                && self.ui.textured_view
-                && self.textured_scene.is_none()
-            {
-                self.enable_textured_view();
-            }
-            ui.separator();
-            toolbar_section_label(ui, "TEMA", theme_accent(self.ui.theme));
-            if ui.button(self.ui.theme.toggled().label()).clicked() {
-                self.ui.theme = self.ui.theme.toggled();
-                apply_editor_theme(ui.ctx(), self.ui.theme);
-                if let Err(error) = self.persist_memory() {
-                    self.ui
-                        .status
-                        .push_str(&format!(" Aviso: memória não salva: {error}"));
+            ui.add_enabled_ui(self.loaded, |ui| {
+                if chrome::icon_button(ui, Icon::Save, "Salvar", false)
+                    .on_hover_text("Salvar geodata · Ctrl+S")
+                    .clicked()
+                {
+                    *action = EditorAction::Save;
                 }
-            }
+            });
+            ui.separator();
+            ui.add_enabled_ui(self.loaded, |ui| {
+                if chrome::icon_button(ui, Icon::Undo, "", false)
+                    .on_hover_text("Desfazer · Ctrl+Z")
+                    .clicked()
+                {
+                    *action = EditorAction::Undo;
+                }
+                if chrome::icon_button(ui, Icon::Redo, "", false)
+                    .on_hover_text("Refazer · Ctrl+Y")
+                    .clicked()
+                {
+                    *action = EditorAction::Redo;
+                }
+            });
+            ui.separator();
+            let name = if self.loaded {
+                self.preview.source_map.name.as_str()
+            } else {
+                "Nenhum projeto aberto"
+            };
+            ui.add(egui::Label::new(egui::RichText::new(name).weak()).truncate(true));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if chrome::icon_button(ui, Icon::Sun, self.ui.theme.toggled().label(), false)
+                    .on_hover_text("Alternar tema do editor")
+                    .clicked()
+                {
+                    self.ui.theme = self.ui.theme.toggled();
+                    apply_editor_theme(ui.ctx(), self.ui.theme);
+                    if let Err(error) = self.persist_memory() {
+                        self.ui
+                            .status
+                            .push_str(&format!(" Aviso: memória não salva: {error}"));
+                    }
+                }
+            });
         });
     }
 
@@ -1349,7 +1514,6 @@ impl EditorView {
         visual_changed: &mut bool,
     ) {
         ui.add_space(4.0);
-        ui.heading("Inspetor");
         ui.label(
             egui::RichText::new(if self.loaded && self.has_context {
                 "Projeto aberto"
@@ -1365,49 +1529,27 @@ impl EditorView {
         );
         ui.separator();
 
-        egui::CollapsingHeader::new(
-            egui::RichText::new("Projeto")
-                .strong()
-                .color(theme_accent(self.ui.theme)),
-        )
-        .default_open(!self.loaded)
-        .show(ui, |ui| self.draw_project_section(ui, action));
-        egui::CollapsingHeader::new(
-            egui::RichText::new("Seleção")
-                .strong()
-                .color(theme_accent(self.ui.theme)),
-        )
-        .default_open(true)
-        .show(ui, |ui| self.draw_selection_section(ui, visual_changed));
-        egui::CollapsingHeader::new(
-            egui::RichText::new("Passabilidade")
-                .strong()
-                .color(theme_accent(self.ui.theme)),
-        )
-        .default_open(true)
-        .show(ui, |ui| {
-            self.draw_passability_section(ui, action, visual_changed)
+        inspector_section(ui, "Projeto", !self.loaded, |ui| {
+            self.draw_project_section(ui, action)
         });
-        egui::CollapsingHeader::new(
-            egui::RichText::new("Bloco")
-                .strong()
-                .color(theme_accent(self.ui.theme)),
-        )
-        .default_open(false)
-        .show(ui, |ui| self.draw_block_section(ui, action));
-        egui::CollapsingHeader::new(
-            egui::RichText::new("Visualização")
-                .strong()
-                .color(theme_accent(self.ui.theme)),
-        )
-        .default_open(false)
-        .show(ui, |ui| self.draw_visualization_section(ui, visual_changed));
+        ui.add_enabled_ui(self.loaded, |ui| {
+            inspector_section(ui, "Seleção", true, |ui| {
+                self.draw_selection_section(ui, visual_changed)
+            });
+            inspector_section(ui, "Passabilidade", true, |ui| {
+                self.draw_passability_section(ui, action, visual_changed)
+            });
+            inspector_section(ui, "Bloco", false, |ui| self.draw_block_section(ui, action));
+            inspector_section(ui, "Visualização", false, |ui| {
+                self.draw_visualization_section(ui, visual_changed)
+            });
+        });
     }
 
     fn draw_project_section(&mut self, ui: &mut egui::Ui, action: &mut EditorAction) {
         ui.horizontal(|ui| {
             ui.label("Cliente");
-            if ui.button("Escolher pasta...").clicked() {
+            if chrome::icon_button(ui, Icon::Folder, "Escolher pasta...", false).clicked() {
                 if let Some(path) = pick_client_directory(&self.ui.client_root) {
                     self.ui.client_root = path.display().to_string();
                     self.ui.status = "Cliente selecionado. Escolha o tipo e a geodata.".into();
@@ -1433,7 +1575,7 @@ impl EditorView {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Geodata");
-            if ui.button("Escolher geodata...").clicked() {
+            if chrome::icon_button(ui, Icon::Folder, "Escolher geodata...", false).clicked() {
                 if let Some(path) = pick_geodata_file(&self.ui.open_path) {
                     self.ui.open_path = path.display().to_string();
                     self.ui.status = "Geodata selecionada. Abra o projeto quando terminar.".into();
@@ -1451,7 +1593,7 @@ impl EditorView {
             }
         }
         ui.add_space(6.0);
-        if ui.button("Carregar projeto").clicked() {
+        if chrome::primary_button(ui, Icon::Layers, "Carregar projeto").clicked() {
             *action = EditorAction::OpenProject;
         }
         ui.label(
@@ -1496,10 +1638,7 @@ impl EditorView {
                             }
                         });
                     *visual_changed |= ui
-                        .checkbox(
-                            &mut self.ui.show_selected_layer_only,
-                            "Exibir somente selecionada",
-                        )
+                        .checkbox(&mut self.ui.show_selected_layer_only, "Só selecionada")
                         .changed();
                 });
                 *visual_changed |= self.ui.visible_layer != previous_layer;
@@ -1588,13 +1727,13 @@ impl EditorView {
         let y = self.ui.selected.y;
         let layer_count = self.document.layer_count(x, y).unwrap_or(0);
         if layer_count > 0 {
-            ui.label(egui::RichText::new("Layers da célula").strong());
+            ui.label(egui::RichText::new("Camadas da célula").strong());
             let mut requested_layer = None;
             egui::Grid::new("editor_cell_layers")
                 .num_columns(2)
                 .spacing([16.0, 3.0])
                 .show(ui, |ui| {
-                    ui.small("Layer");
+                    ui.small("Camada");
                     ui.small("Altura");
                     ui.end_row();
                     for layer_index in 0..layer_count {
@@ -1634,14 +1773,17 @@ impl EditorView {
         let bx = self.ui.selected.x / 8;
         let by = self.ui.selected.y / 8;
         ui.horizontal(|ui| {
-            let mask = (layer.nswe & 0x0f) as usize;
-            let icon = &self.nswe_icons[mask];
-            let response = egui::Frame::none()
-                .fill(egui::Color32::from_rgb(232, 236, 240))
-                .rounding(3.0)
-                .inner_margin(egui::Margin::same(2.0))
-                .show(ui, |ui| ui.image((icon.id(), egui::vec2(32.0, 32.0))))
-                .inner;
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(60.0, 60.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+            chrome::paint_nswe(
+                ui.painter(),
+                rect.shrink(5.0),
+                layer.nswe,
+                theme_accent(self.ui.theme),
+                theme_muted_color(self.ui.theme),
+            );
             response.on_hover_text(format!(
                 "NSWE {:04b} — N {}  S {}  W {}  E {}",
                 layer.nswe & 0x0f,
@@ -1819,6 +1961,7 @@ impl EditorView {
     }
 
     fn draw_editor_status(&self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.y = 2.0;
         let [camera_x, camera_y, camera_z] =
             camera_location(self.preview.source_map.bounds, self.preview.camera.position);
         let bx = self.ui.selected.x / 8;
@@ -1830,7 +1973,7 @@ impl EditorView {
         };
         let summary_width = ui.available_width();
         ui.allocate_ui_with_layout(
-            egui::vec2(summary_width, 24.0),
+            egui::vec2(summary_width, 20.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.label(egui::RichText::new(format!("MAPA: {map_name}")).strong());
@@ -1860,9 +2003,11 @@ impl EditorView {
         };
         let status_color = editor_status_color(status, self.ui.theme);
         ui.add_sized(
-            [ui.available_width(), 42.0],
-            egui::Label::new(egui::RichText::new(status).color(status_color)).wrap(true),
-        );
+            [ui.available_width(), 18.0],
+            egui::Label::new(egui::RichText::new(status).small().color(status_color))
+                .truncate(true),
+        )
+        .on_hover_text(status);
     }
 
     fn apply(&mut self, action: EditorAction) {
@@ -2255,10 +2400,14 @@ impl EditorView {
 
     fn pick(&self) -> Option<LayerAddress> {
         let position = self.ui.last_cursor?;
-        let width = self.preview.config.width.max(1) as f32;
-        let height = self.preview.config.height.max(1) as f32;
-        let x = position.x as f32 / width * 2.0 - 1.0;
-        let y = 1.0 - position.y as f32 / height * 2.0;
+        let viewport = viewport_pixels(
+            self.viewport,
+            self.preview.window.scale_factor() as f32,
+            [self.preview.config.width, self.preview.config.height],
+        );
+        let [x, y] = viewport_ndc(viewport, egui::pos2(position.x as f32, position.y as f32))?;
+        let width = viewport.width();
+        let height = viewport.height();
         let forward = self.preview.camera.forward();
         let right = normalize(cross(forward, [0.0, 1.0, 0.0]));
         let up = cross(right, forward);
@@ -2759,29 +2908,39 @@ fn reconstruct_route(
     (!route.is_empty()).then_some(route)
 }
 
-/// Darkest/lightest background tone in the palette, reserved for recessed
-/// surfaces such as the loading screen and text-edit backgrounds. Values are
-/// kept neutral gray (no color tint) and mid-toned: enough contrast to read
-/// as its theme without collapsing into a near-black or glaring-white
-/// background.
+/// Clamp to the surface even while panels resize or the window is minimized.
+fn viewport_pixels(rect: egui::Rect, scale: f32, surface: [u32; 2]) -> egui::Rect {
+    let size = egui::vec2(surface[0].max(1) as f32, surface[1].max(1) as f32);
+    let min = egui::pos2(
+        (rect.left() * scale).floor().clamp(0.0, size.x - 1.0),
+        (rect.top() * scale).floor().clamp(0.0, size.y - 1.0),
+    );
+    let max = egui::pos2(
+        (rect.right() * scale).ceil().clamp(min.x + 1.0, size.x),
+        (rect.bottom() * scale).ceil().clamp(min.y + 1.0, size.y),
+    );
+    egui::Rect::from_min_max(min, max)
+}
+
+fn viewport_ndc(rect: egui::Rect, point: egui::Pos2) -> Option<[f32; 2]> {
+    if !rect.contains(point) {
+        return None;
+    }
+    Some([
+        (point.x - rect.left()) / rect.width() * 2.0 - 1.0,
+        1.0 - (point.y - rect.top()) / rect.height() * 2.0,
+    ])
+}
+
 fn theme_extreme_bg(theme: EditorTheme) -> egui::Color32 {
-    match theme {
-        EditorTheme::Dark => egui::Color32::from_gray(30),
-        EditorTheme::Light => egui::Color32::from_gray(250),
-    }
+    chrome::background(theme)
 }
 
-/// Neutral gray accent for headings, active highlights, and the loading
-/// screen. Carries no hue of its own; hierarchy comes from contrasting with
-/// body text, not from color.
 fn theme_accent(theme: EditorTheme) -> egui::Color32 {
-    match theme {
-        EditorTheme::Dark => egui::Color32::from_gray(224),
-        EditorTheme::Light => egui::Color32::from_gray(40),
-    }
+    chrome::accent(theme)
 }
 
-/// Muted secondary text: loading subtitle, "waiting for project" status.
+/// Secondary text for status messages and supporting details.
 fn theme_muted_color(theme: EditorTheme) -> egui::Color32 {
     match theme {
         EditorTheme::Dark => egui::Color32::from_rgb(190, 200, 210),
@@ -2806,46 +2965,29 @@ fn theme_error_color(theme: EditorTheme) -> egui::Color32 {
 }
 
 fn apply_editor_theme(context: &egui::Context, theme: EditorTheme) {
-    let mut style = (*context.style()).clone();
-    style.visuals = match theme {
-        EditorTheme::Dark => egui::Visuals::dark(),
-        EditorTheme::Light => egui::Visuals::light(),
-    };
-    let (panel, window, faint, selection_bg, selection_stroke, inactive, hovered, active) =
-        match theme {
-            EditorTheme::Dark => (42, 48, 56, 92, 210, 60, 78, 104),
-            EditorTheme::Light => (244, 250, 236, 206, 90, 228, 214, 198),
-        };
-    style.visuals.panel_fill = egui::Color32::from_gray(panel);
-    style.visuals.window_fill = egui::Color32::from_gray(window);
-    style.visuals.faint_bg_color = egui::Color32::from_gray(faint);
-    style.visuals.extreme_bg_color = theme_extreme_bg(theme);
-    style.visuals.selection.bg_fill = egui::Color32::from_gray(selection_bg);
-    style.visuals.selection.stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(selection_stroke));
-    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(inactive);
-    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(hovered);
-    style.visuals.widgets.active.bg_fill = egui::Color32::from_gray(active);
-    // The default dark `noninteractive.fg_stroke` (used for every plain
-    // label and heading with no explicit color) is gray(140), which reads
-    // as too close to the mid-gray panel background. Light theme keeps its
-    // own default (already dark-on-light, legible) untouched.
-    if theme == EditorTheme::Dark {
-        style.visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_gray(235);
-    }
-    style.spacing.item_spacing = egui::vec2(7.0, 6.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
-    context.set_style(style);
+    chrome::apply_theme(context, theme);
 }
 
-fn toolbar_section_label(ui: &mut egui::Ui, text: &str, accent: egui::Color32) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(82.0, 24.0),
-        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-        |ui| {
-            ui.label(egui::RichText::new(text).size(11.0).strong().color(accent));
-        },
-    );
+fn inspector_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    open: bool,
+    content: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::none()
+        .fill(ui.visuals().faint_bg_color)
+        .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            egui::CollapsingHeader::new(egui::RichText::new(title).strong())
+                .default_open(open)
+                .show(ui, |ui| {
+                    ui.add_space(6.0);
+                    content(ui);
+                    ui.add_space(6.0);
+                });
+        });
+    ui.add_space(2.0);
 }
 
 fn editor_status_color(status: &str, theme: EditorTheme) -> egui::Color32 {
@@ -2884,87 +3026,38 @@ fn nswe_preset_tooltip(mask: u8) -> String {
     )
 }
 
-/// Draws a crisp, scale-independent version of the legacy NSWE icon. The PNG
-/// assets remain in use on the 3D overlay, but buttons need vector strokes so
-/// they stay clear on high-DPI monitors and never inherit the dark texture
-/// background from the inspector theme.
+/// Vector presets share their direction grammar with the cell summary.
 fn draw_nswe_preset_button(ui: &mut egui::Ui, mask: u8, selected: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(46.0, 46.0), egui::Sense::click());
-    let background = if selected {
-        egui::Color32::from_rgb(33, 187, 205)
-    } else if response.hovered() {
-        egui::Color32::from_rgb(249, 251, 252)
-    } else {
-        egui::Color32::from_rgb(224, 229, 233)
-    };
-    let border = if selected {
-        egui::Color32::from_rgb(127, 244, 255)
-    } else {
-        egui::Color32::from_rgb(157, 170, 178)
-    };
-    let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, background);
-    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0_f32, border));
-
-    let center = rect.center();
-    let tip = 7.5;
-    let offset = 11.0;
-    let arrow_stroke = egui::Stroke::new(1.35_f32, egui::Color32::from_rgb(28, 36, 42));
-    let draw_arrow = |points: [egui::Pos2; 3], open: bool| {
-        if open {
-            // Keep only the outside sides of an open arrow. Drawing its base
-            // would join the four arrows into an unwanted square at center.
-            painter.line_segment([points[0], points[1]], arrow_stroke);
-            painter.line_segment([points[0], points[2]], arrow_stroke);
-        } else {
-            painter.add(egui::Shape::convex_polygon(
-                points.to_vec(),
-                egui::Color32::from_rgb(28, 36, 42),
-                arrow_stroke,
-            ));
-        }
-    };
-    draw_arrow(
-        [
-            egui::pos2(center.x, center.y - offset - tip),
-            egui::pos2(center.x - tip, center.y - offset + tip),
-            egui::pos2(center.x + tip, center.y - offset + tip),
-        ],
-        mask & Direction::North.bit() != 0,
+    let response = ui.add(
+        egui::Button::new("")
+            .min_size(egui::vec2(42.0, 42.0))
+            .selected(selected),
     );
-    draw_arrow(
-        [
-            egui::pos2(center.x, center.y + offset + tip),
-            egui::pos2(center.x - tip, center.y + offset - tip),
-            egui::pos2(center.x + tip, center.y + offset - tip),
-        ],
-        mask & Direction::South.bit() != 0,
-    );
-    draw_arrow(
-        [
-            egui::pos2(center.x - offset - tip, center.y),
-            egui::pos2(center.x - offset + tip, center.y - tip),
-            egui::pos2(center.x - offset + tip, center.y + tip),
-        ],
-        mask & Direction::West.bit() != 0,
-    );
-    draw_arrow(
-        [
-            egui::pos2(center.x + offset + tip, center.y),
-            egui::pos2(center.x + offset - tip, center.y - tip),
-            egui::pos2(center.x + offset - tip, center.y + tip),
-        ],
-        mask & Direction::East.bit() != 0,
+    chrome::paint_nswe(
+        ui.painter(),
+        response.rect.shrink(4.0),
+        mask,
+        ui.visuals().selection.stroke.color,
+        ui.visuals().weak_text_color(),
     );
     response
 }
 
 fn selected_path_label(ui: &mut egui::Ui, value: &str, empty_message: &str) {
-    if value.trim().is_empty() {
-        ui.small(egui::RichText::new(empty_message).weak());
+    let text = if value.trim().is_empty() {
+        empty_message
     } else {
-        ui.small(value);
-    }
+        value
+    };
+    egui::Frame::none()
+        .fill(ui.visuals().extreme_bg_color)
+        .rounding(3.0)
+        .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+        .show(ui, |ui| {
+            ui.set_min_width((ui.available_width() - 1.0).max(0.0));
+            ui.add(egui::Label::new(egui::RichText::new(text).small().weak()).truncate(true))
+                .on_hover_text(text);
+        });
 }
 
 fn dialog_directory(value: &str) -> Option<PathBuf> {
@@ -5180,6 +5273,44 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewport_picking_tracks_panel_bounds_and_display_scale() {
+        let logical = egui::Rect::from_min_max(egui::pos2(0.0, 112.0), egui::pos2(1088.0, 944.0));
+        for scale in [1.0, 1.25, 2.0] {
+            let viewport = viewport_pixels(
+                logical,
+                scale,
+                [(1440.0 * scale) as u32, (1000.0 * scale) as u32],
+            );
+            assert_eq!(viewport_ndc(viewport, viewport.center()), Some([0.0, 0.0]));
+            assert_eq!(
+                viewport_ndc(viewport, viewport.left_top()),
+                Some([-1.0, 1.0])
+            );
+            assert_eq!(
+                viewport_ndc(viewport, viewport.right_bottom()),
+                Some([1.0, -1.0])
+            );
+            assert_eq!(
+                viewport_ndc(viewport, viewport.right_center() + egui::vec2(1.0, 0.0)),
+                None
+            );
+            assert_eq!(viewport_ndc(viewport, egui::pos2(100.0, 20.0)), None);
+        }
+    }
+
+    #[test]
+    fn viewport_remains_valid_when_panels_exceed_a_small_surface() {
+        let rect = viewport_pixels(
+            egui::Rect::from_min_max(egui::pos2(0.0, 112.0), egui::pos2(-200.0, -30.0)),
+            1.5,
+            [120, 90],
+        );
+        assert!(rect.width() >= 1.0 && rect.height() >= 1.0);
+        assert!(rect.left() >= 0.0 && rect.top() >= 0.0);
+        assert!(rect.right() <= 120.0 && rect.bottom() <= 90.0);
+    }
 
     /// Renders one full-viewport, up-facing triangle through the real
     /// textured pipeline and returns the resolved frame. Exercises the WGSL,

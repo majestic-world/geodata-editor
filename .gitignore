@@ -1,4 +1,6 @@
 /target/
+# The mapEditor app is a separate crate with its own build directory.
+/mapEditor/target/
 /output/
 /dist/
 /reverse/
