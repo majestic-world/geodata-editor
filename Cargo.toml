@@ -9,7 +9,7 @@ build = "build.rs"
 autobins = false
 
 [[bin]]
-name = "GeodataEditor"
+name = "geodata-editor"
 path = "src/bin/geodata_editor.rs"
 
 [profile.release]

@@ -12,6 +12,11 @@ make build
 O executável público será criado em `dist\GeodataEditor.exe`. O perfil de
 release usa LTO e remove símbolos de depuração antes da cópia.
 
+Para executar pelo Cargo, use `cargo run --release`. O alvo Cargo se chama
+`geodata-editor` e gera `target\release\geodata-editor.exe`; o `make build`
+empacota esse binário como `dist\GeodataEditor.exe`, preservando o nome público
+usado pelas releases e pela atualização automática.
+
 ## Atualização automática
 
 Ao iniciar, o editor consulta a última release publicada no GitHub. Uma versão

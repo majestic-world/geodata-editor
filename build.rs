@@ -2,7 +2,7 @@ fn main() {
     #[cfg(windows)]
     {
         println!("cargo:rerun-if-changed=assets/favicon.ico");
-        compile("resources/GeodataEditor.rc", "GeodataEditor");
+        compile("resources/GeodataEditor.rc", "geodata-editor");
     }
 }
 
