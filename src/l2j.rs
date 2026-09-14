@@ -284,11 +284,13 @@ struct BlockState {
     original: EditableBlock,
     current: EditableBlock,
     bytes: Range<usize>,
+    dirty: bool,
+    render_pending: bool,
 }
 
 impl BlockState {
     fn dirty(&self) -> bool {
-        self.original != self.current
+        self.dirty
     }
 }
 
@@ -339,6 +341,8 @@ pub struct Document {
     original_bytes: Vec<u8>,
     format: StorageFormat,
     blocks: Vec<BlockState>,
+    changed_block_count: usize,
+    render_changes: Vec<(usize, usize)>,
     original_path: Option<PathBuf>,
     undo: Vec<EditOperation>,
     redo: Vec<EditOperation>,
@@ -379,6 +383,8 @@ impl Document {
                 current: original.clone(),
                 original,
                 bytes: start..cursor.position,
+                dirty: false,
+                render_pending: false,
             });
         }
         if cursor.position != original_bytes.len() {
@@ -392,6 +398,8 @@ impl Document {
             original_bytes,
             format,
             blocks,
+            changed_block_count: 0,
+            render_changes: Vec::new(),
             original_path: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -419,7 +427,19 @@ impl Document {
     }
 
     pub fn changed_blocks(&self) -> usize {
-        self.blocks.iter().filter(|state| state.dirty()).count()
+        self.changed_block_count
+    }
+
+    /// Drains blocks whose content changed since the previous call, including
+    /// neighbours changed by symmetric NSWE edits. Coordinates are deduplicated
+    /// until drained; reverting to the original content still invalidates a
+    /// previously rendered block. Newly opened documents start with no changes.
+    pub(crate) fn take_render_changes(&mut self) -> Vec<(usize, usize)> {
+        let changes = std::mem::take(&mut self.render_changes);
+        for &(x, y) in &changes {
+            self.blocks[y + x * BLOCKS_PER_AXIS].render_pending = false;
+        }
+        changes
     }
 
     pub fn cell(&self, address: LayerAddress) -> Option<Layer> {
@@ -626,6 +646,7 @@ impl Document {
         };
         for (index, block) in &operation.before {
             self.blocks[*index].current = block.clone();
+            self.refresh_block_state(*index);
         }
         self.redo.push(operation);
         true
@@ -637,6 +658,7 @@ impl Document {
         };
         for (index, block) in &operation.after {
             self.blocks[*index].current = block.clone();
+            self.refresh_block_state(*index);
         }
         self.undo.push(operation);
         true
@@ -948,6 +970,9 @@ impl Document {
         if before.is_empty() {
             return;
         }
+        for &(index, _) in &before {
+            self.refresh_block_state(index);
+        }
         let after = before
             .iter()
             .map(|(index, _)| (*index, self.blocks[*index].current.clone()))
@@ -958,6 +983,25 @@ impl Document {
             after,
         });
         self.redo.clear();
+    }
+
+    /// Updates only a block already known to have changed in this operation.
+    fn refresh_block_state(&mut self, index: usize) {
+        let state = &mut self.blocks[index];
+        let dirty = state.current != state.original;
+        if dirty != state.dirty {
+            if dirty {
+                self.changed_block_count += 1;
+            } else {
+                self.changed_block_count -= 1;
+            }
+            state.dirty = dirty;
+        }
+        if !state.render_pending {
+            state.render_pending = true;
+            self.render_changes
+                .push((index / BLOCKS_PER_AXIS, index % BLOCKS_PER_AXIS));
+        }
     }
 }
 
@@ -1441,6 +1485,111 @@ mod tests {
         assert!(document.redo());
     }
     #[test]
+    fn dirty_count_tracks_manual_reverts_and_history() {
+        let bytes = first_complex_then_simple();
+        let mut document = Document::from_bytes(bytes.clone()).unwrap();
+        let target = LayerAddress::new(3, 4, 0);
+        assert_eq!(document.changed_blocks(), 0);
+        assert!(!document.is_block_dirty(0, 0));
+        assert!(document.take_render_changes().is_empty());
+
+        document.force_set_nswe([target], 0, "close");
+        document.set_height([target], 64, "raise").unwrap();
+        assert_eq!(document.changed_blocks(), 1);
+        assert!(document.is_block_dirty(0, 0));
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
+
+        document.force_set_nswe([target], Layer::OPEN, "reopen");
+        assert_eq!(document.changed_blocks(), 1);
+        document.set_height([target], 0, "lower").unwrap();
+        assert_eq!(document.changed_blocks(), 0);
+        assert!(!document.is_block_dirty(0, 0));
+        assert_eq!(document.to_bytes().unwrap(), bytes);
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
+
+        assert!(document.undo());
+        assert_eq!(document.changed_blocks(), 1);
+        assert!(document.is_block_dirty(0, 0));
+        assert_eq!(document.cell(target).unwrap().height, 64);
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
+        assert!(document.redo());
+        assert_eq!(document.changed_blocks(), 0);
+        assert!(!document.is_block_dirty(0, 0));
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
+        assert_eq!(document.to_bytes().unwrap(), bytes);
+
+        document.force_set_nswe([target], Layer::OPEN, "unchanged");
+        document.set_height([target], 0, "unchanged").unwrap();
+        assert!(document.take_render_changes().is_empty());
+        assert_eq!(document.changed_blocks(), 0);
+    }
+
+    #[test]
+    fn render_changes_include_symmetric_neighbours_and_drain_between_operations() {
+        let bytes = simple_file(32);
+        let mut document = Document::from_bytes(bytes.clone()).unwrap();
+        let target = LayerAddress::new(7, 7, 0);
+        document.set_nswe([target], 0, "close corner");
+        document.set_nswe([target], 0, "close again");
+        assert_eq!(document.changed_blocks(), 3);
+        let expected = [(0, 0), (0, 1), (1, 0)];
+        for (x, y) in expected {
+            assert!(document.is_block_dirty(x, y));
+        }
+        let mut changes = document.take_render_changes();
+        changes.sort_unstable();
+        assert_eq!(changes, expected);
+        assert!(document.take_render_changes().is_empty());
+
+        assert!(document.undo());
+        assert_eq!(document.changed_blocks(), 0);
+        assert_eq!(document.to_bytes().unwrap(), bytes);
+        let mut changes = document.take_render_changes();
+        changes.sort_unstable();
+        assert_eq!(changes, expected);
+        assert!(document.redo());
+        assert_eq!(document.changed_blocks(), 3);
+        let mut changes = document.take_render_changes();
+        changes.sort_unstable();
+        assert_eq!(changes, expected);
+
+        assert!(document.restore_block(0, 0).unwrap());
+        assert_eq!(document.changed_blocks(), 2);
+        assert!(!document.is_block_dirty(0, 0));
+        assert!(document.is_block_dirty(0, 1));
+        assert!(document.is_block_dirty(1, 0));
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
+        assert!(document.undo());
+        assert_eq!(document.changed_blocks(), 3);
+        assert!(document.redo());
+        assert_eq!(document.changed_blocks(), 2);
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
+    }
+
+    #[test]
+    fn rejected_targets_do_not_hide_successful_edits_or_enqueue_unchanged_blocks() {
+        let mut document = Document::from_bytes(simple_file(32)).unwrap();
+        let valid = LayerAddress::new(8, 8, 0);
+        let invalid = LayerAddress::new(MAP_CELLS, 8, 0);
+        let result = document.set_height([valid, invalid], 64, "mixed").unwrap();
+        assert_eq!(result.changed_cells, 1);
+        assert_eq!(result.rejected_cells.len(), 1);
+        assert_eq!(document.changed_blocks(), 1);
+        assert!(document.is_block_dirty(1, 1));
+        assert_eq!(document.take_render_changes(), [(1, 1)]);
+
+        assert!(document.convert_to_simple(1, 1).is_err());
+        assert!(document.restore_block(BLOCKS_PER_AXIS, 0).is_err());
+        assert!(document.set_height([valid], i32::MAX, "invalid").is_err());
+        assert_eq!(document.changed_blocks(), 1);
+        assert_eq!(document.cell(valid).unwrap().height, 64);
+        assert!(document.take_render_changes().is_empty());
+        assert!(document.undo());
+        assert_eq!(document.changed_blocks(), 0);
+        assert_eq!(document.cell(valid).unwrap().height, 32);
+        assert_eq!(document.take_render_changes(), [(1, 1)]);
+    }
+    #[test]
     fn editing_height_promotes_simple_and_normalizes_to_l2j_steps() {
         let bytes = simple_file(32);
         let mut document = Document::from_bytes(bytes.clone()).unwrap();
@@ -1544,19 +1693,41 @@ mod tests {
                 .nswe,
             0
         );
+        assert_eq!(document.changed_blocks(), 1);
+        assert!(document.is_block_dirty(0, 0));
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
+        assert!(document.restore_block(0, 0).unwrap());
+        assert_eq!(document.changed_blocks(), 0);
+        assert_eq!(document.to_bytes().unwrap(), original);
         fs::remove_file(path).expect("remove temporary replacement");
         fs::remove_file(backup).expect("remove temporary backup");
     }
     #[test]
     fn conversions_and_restore_are_checked() {
-        let mut document = Document::from_bytes(simple_file(32)).unwrap();
+        let bytes = simple_file(0x012f);
+        let mut document = Document::from_bytes(bytes.clone()).unwrap();
         assert!(document.convert_simple_to_complex(0, 0).unwrap());
+        assert_eq!(document.changed_blocks(), 1);
+        assert!(document.is_block_dirty(0, 0));
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
         assert!(document.convert_complex_to_multilayer(0, 0).unwrap());
+        assert_eq!(document.changed_blocks(), 1);
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
         assert!(document.convert_multilayer_to_complex(0, 0).unwrap());
+        assert_eq!(document.changed_blocks(), 1);
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
         assert!(document.convert_to_simple(0, 0).unwrap());
+        assert_eq!(document.changed_blocks(), 0);
+        assert!(!document.is_block_dirty(0, 0));
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
+        assert_eq!(document.to_bytes().unwrap(), bytes);
         document.set_nswe([LayerAddress::new(0, 0, 0)], 0, "bloquear");
         assert!(document.restore_block(0, 0).unwrap());
         assert_eq!(document.changed_blocks(), 0);
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
+        assert_eq!(document.to_bytes().unwrap(), bytes);
+        assert!(!document.restore_block(0, 0).unwrap());
+        assert!(document.take_render_changes().is_empty());
 
         assert!(
             document
@@ -1567,8 +1738,12 @@ mod tests {
             document.block_type(0, 0),
             Some(EditableBlockType::Multilayer)
         );
+        assert_eq!(document.changed_blocks(), 1);
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
         assert!(document.undo());
         assert_eq!(document.block_type(0, 0), Some(EditableBlockType::Simple));
+        assert_eq!(document.changed_blocks(), 0);
+        assert_eq!(document.take_render_changes(), [(0, 0)]);
     }
     fn l2g_file(body: Vec<u8>) -> Vec<u8> {
         let header = [0x12, 0x34, 0x56, 0x78];

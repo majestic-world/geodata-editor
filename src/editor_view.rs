@@ -1,8 +1,10 @@
 //! Native editor renderer for L2J collision context and editable cells.
 
 use std::{
+    borrow::Cow,
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
+    ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::Instant,
@@ -25,32 +27,32 @@ use crate::{
     error::{AppError, Result},
     geometry::{Box3, Triangle, Vec3},
     l2j::{self, Direction, Document, EditableBlockType, Layer, LayerAddress, NULL_HEIGHT},
-    unreal::{PackageLoader, SourceMap, VisualBatch, VisualScene},
+    unreal::{PackageLoader, SourceMap, VisualBatch},
 };
+
+mod loading;
+mod overlays;
 
 /// Opens the standalone editor over the map's collision context.
 pub fn run_editor(options: EditorOptions) -> Result<()> {
     let memory = editor::load_memory();
-    let (source_map, package_count, pending_flavour) = editor_source_map(&options)?;
-    // Nothing was loaded when a confirmation is pending: the project opens
-    // through the same path as the Carregar button once the user answers.
-    let loaded_context = pending_flavour.is_none();
-    let (document, loaded) = match &options.input {
-        Some(path) => (Document::open(path)?, true),
-        None => (Document::blank(), false),
-    };
+    let open_requested = options.input.is_some();
+    let source_map = welcome_source_map(&options);
+    let document = Document::blank();
     let event_loop = EventLoop::new()
         .map_err(|error| AppError::InvalidData(format!("can't start editor window: {error}")))?;
     let mut editor = pollster::block_on(EditorView::new(
         &event_loop,
         source_map,
         document,
-        loaded && options.client_root.is_some() && loaded_context,
-        package_count,
+        false,
+        0,
         options,
         memory,
     ))?;
-    editor.ui.pending_flavour = pending_flavour;
+    if open_requested {
+        editor.open_project();
+    }
     event_loop
         .run(move |event, target| {
             target.set_control_flow(ControlFlow::Poll);
@@ -185,38 +187,6 @@ fn map_package_or_prompt(
     }
 }
 
-/// Loads the collision context for the CLI-provided project, if any.
-///
-/// When the region only exists under the other client flavour, nothing is
-/// loaded and the confirmation is handed back so the editor can ask inside
-/// its own UI, on the welcome screen.
-fn editor_source_map(
-    options: &EditorOptions,
-) -> Result<(SourceMap, usize, Option<PendingFlavour>)> {
-    if let (Some(root), Some(input)) = (&options.client_root, &options.input) {
-        let region = editor::geodata_region(input).ok_or_else(|| {
-            AppError::InvalidArgument(format!("invalid geodata name: {}", input.display()))
-        })?;
-        let map_type = options.map_type.unwrap_or_default();
-        let loader = PackageLoader::new(root.clone(), 0, false);
-        match map_package_or_prompt(&loader, &region, map_type) {
-            Ok(package) => {
-                let source = loader.load_map(&package)?;
-                let count = loader.loaded_package_count();
-                return Ok((source, count, None));
-            }
-            Err(None) => {
-                return Err(AppError::Missing(format!(
-                    "can't find package: {}",
-                    map_type.package_name(&region)
-                )));
-            }
-            Err(Some(pending)) => return Ok((welcome_source_map(options), 0, Some(pending))),
-        }
-    }
-    Ok((welcome_source_map(options), 0, None))
-}
-
 /// Placeholder map shown while no project is loaded.
 fn welcome_source_map(options: &EditorOptions) -> SourceMap {
     let name = options
@@ -253,8 +223,8 @@ const NORMAL_MOVE_SPEED: f32 = 0.08;
 struct Preview {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     depth_view: wgpu::TextureView,
@@ -267,7 +237,7 @@ struct Preview {
     nswe_icon_pipeline: wgpu::RenderPipeline,
     nswe_icon_bind_group: wgpu::BindGroup,
     textured_pipeline: wgpu::RenderPipeline,
-    material_texture_layout: wgpu::BindGroupLayout,
+    material_texture_layout: Arc<wgpu::BindGroupLayout>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera: Camera,
@@ -416,8 +386,8 @@ impl Preview {
         Ok(Self {
             window,
             surface,
-            device,
-            queue,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
             config,
             size,
             depth_view,
@@ -430,7 +400,7 @@ impl Preview {
             nswe_icon_pipeline,
             nswe_icon_bind_group,
             textured_pipeline,
-            material_texture_layout,
+            material_texture_layout: Arc::new(material_texture_layout),
             camera_buffer,
             camera_bind_group,
             camera,
@@ -618,8 +588,8 @@ struct EditorView {
     /// Logical viewport bounds; rendering and picking use the same rectangle.
     viewport: egui::Rect,
     ui: EditorUi,
-    geodata_mesh: GeodataInstances,
-    nswe_icon_mesh: NsweIconInstances,
+    overlays: overlays::OverlayMeshes,
+    loading: loading::LoadingState,
     /// Cached GPU form of the textured visualization, built lazily the
     /// first time `ui.textured_view` is enabled for the current project.
     textured_scene: Option<TexturedScene>,
@@ -651,7 +621,7 @@ impl BrushAnchor {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct EditorUi {
     open_path: String,
     selection_hidden: bool,
@@ -784,16 +754,6 @@ impl EditorSelectionLookup {
     }
 }
 
-fn editor_active_selection(ui: &EditorUi) -> Vec<LayerAddress> {
-    if ui.selection_hidden {
-        Vec::new()
-    } else if ui.selection.is_empty() {
-        vec![ui.selected]
-    } else {
-        ui.selection.clone()
-    }
-}
-
 fn editor_active_selection_count(ui: &EditorUi) -> usize {
     if ui.selection_hidden {
         0
@@ -899,32 +859,8 @@ impl EditorView {
             ui.status = "Informe o cliente e a geodata para carregar o projeto.".into();
         }
         let max_layer_count = document.max_layer_count().max(1);
-        let origin = map_origin(preview.source_map.bounds);
-        let active_selection = editor_active_selection(&ui);
-        let selection_lookup = EditorSelectionLookup::new(&document, &active_selection);
-        let geodata_mesh = GeodataInstances::new(
-            &preview.device,
-            &editor_geodata_instances(
-                &preview.source_map,
-                &document,
-                origin,
-                ui.visual_stride,
-                EditorOverlayOptions::from_ui(&ui),
-                &selection_lookup,
-            ),
-        );
-        let nswe_icon_mesh = NsweIconInstances::new(
-            &preview.device,
-            &editor_nswe_icon_instances(
-                &preview.source_map,
-                &document,
-                origin,
-                ui.visual_stride,
-                EditorOverlayOptions::from_ui(&ui),
-                &selection_lookup,
-            ),
-        );
-        let view = Self {
+        let overlays = overlays::OverlayMeshes::new(&preview.device);
+        let mut view = Self {
             preview,
             document,
             loaded,
@@ -933,11 +869,12 @@ impl EditorView {
             max_layer_count,
             viewport: egui::Rect::NOTHING,
             ui,
-            geodata_mesh,
-            nswe_icon_mesh,
+            overlays,
+            loading: loading::LoadingState::default(),
             textured_scene: None,
         };
         if view.loaded && view.has_context {
+            view.refresh_editor_meshes();
             let _ = view.persist_memory();
         }
         Ok(view)
@@ -954,6 +891,7 @@ impl EditorView {
                         && self.ui.keyboard_height_adjust
                         && self.loaded
                         && self.has_context
+                        && !self.loading.is_project_loading()
                     {
                         let delta = match code {
                             KeyCode::ArrowUp => Some(i32::from(l2j::HEIGHT_STEP)),
@@ -1012,6 +950,7 @@ impl EditorView {
         if canvas_input
             && self.loaded
             && self.has_context
+            && !self.loading.is_project_loading()
             && !self.preview.input.uses_left_for_vertical_navigation()
         {
             if let WindowEvent::MouseInput {
@@ -1071,6 +1010,7 @@ impl EditorView {
     }
 
     fn render(&mut self) -> std::result::Result<(), wgpu::SurfaceError> {
+        self.poll_loading();
         let output = self.preview.surface.get_current_texture()?;
         let view = output
             .texture
@@ -1081,6 +1021,9 @@ impl EditorView {
             .take_egui_input(self.preview.window.as_ref());
         let context = self.preview.egui_context.clone();
         let full_output = context.run(raw_input, |context| self.draw_ui(context));
+        if self.loaded && self.overlays.needs_icons(&self.ui) {
+            self.refresh_editor_meshes();
+        }
         let viewport = viewport_pixels(
             self.viewport,
             self.preview.window.scale_factor() as f32,
@@ -1172,20 +1115,18 @@ impl EditorView {
             }
             let blocks_visible = self.loaded && self.has_context && !self.ui.hide_all_blocks;
             if blocks_visible {
-                draw_geodata(
+                self.overlays.draw_geodata(
                     &mut pass,
                     &self.preview.geodata_overlay_pipeline,
-                    &self.geodata_mesh,
                     &self.preview.camera_bind_group,
                     false,
                 );
                 // The selected cells already use yellow in the base geodata
                 // mesh. Draw only their NSWE glyphs over that same surface.
                 if self.ui.show_nswe_icons {
-                    draw_nswe_icons(
+                    self.overlays.draw_icons(
                         &mut pass,
                         &self.preview.nswe_icon_pipeline,
-                        &self.nswe_icon_mesh,
                         &self.preview.camera_bind_group,
                         &self.preview.nswe_icon_bind_group,
                     );
@@ -1196,10 +1137,9 @@ impl EditorView {
                     self.preview.draw_collision_meshes(&mut pass, true);
                 }
                 if blocks_visible {
-                    draw_geodata(
+                    self.overlays.draw_geodata(
                         &mut pass,
                         &self.preview.geodata_line_pipeline,
-                        &self.geodata_mesh,
                         &self.preview.camera_bind_group,
                         true,
                     );
@@ -1460,7 +1400,7 @@ impl EditorView {
             {
                 *action = EditorAction::OpenProject;
             }
-            ui.add_enabled_ui(self.loaded, |ui| {
+            ui.add_enabled_ui(self.loaded && !self.loading.is_project_loading(), |ui| {
                 if chrome::icon_button(ui, Icon::Save, "Salvar", false)
                     .on_hover_text("Salvar geodata · Ctrl+S")
                     .clicked()
@@ -1469,7 +1409,7 @@ impl EditorView {
                 }
             });
             ui.separator();
-            ui.add_enabled_ui(self.loaded, |ui| {
+            ui.add_enabled_ui(self.loaded && !self.loading.is_project_loading(), |ui| {
                 if chrome::icon_button(ui, Icon::Undo, "", false)
                     .on_hover_text("Desfazer · Ctrl+Z")
                     .clicked()
@@ -1484,6 +1424,10 @@ impl EditorView {
                 }
             });
             ui.separator();
+            if self.loading.is_busy() {
+                ui.spinner();
+                ui.label("Carregando...");
+            }
             let name = if self.loaded {
                 self.preview.source_map.name.as_str()
             } else {
@@ -1491,18 +1435,20 @@ impl EditorView {
             };
             ui.add(egui::Label::new(egui::RichText::new(name).weak()).truncate(true));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if chrome::icon_button(ui, Icon::Sun, self.ui.theme.toggled().label(), false)
-                    .on_hover_text("Alternar tema do editor")
-                    .clicked()
-                {
-                    self.ui.theme = self.ui.theme.toggled();
-                    apply_editor_theme(ui.ctx(), self.ui.theme);
-                    if let Err(error) = self.persist_memory() {
-                        self.ui
-                            .status
-                            .push_str(&format!(" Aviso: memória não salva: {error}"));
+                ui.add_enabled_ui(!self.loading.is_busy(), |ui| {
+                    if chrome::icon_button(ui, Icon::Sun, self.ui.theme.toggled().label(), false)
+                        .on_hover_text("Alternar tema do editor")
+                        .clicked()
+                    {
+                        self.ui.theme = self.ui.theme.toggled();
+                        apply_editor_theme(ui.ctx(), self.ui.theme);
+                        if let Err(error) = self.persist_memory() {
+                            self.ui
+                                .status
+                                .push_str(&format!(" Aviso: memória não salva: {error}"));
+                        }
                     }
-                }
+                });
             });
         });
     }
@@ -1529,10 +1475,15 @@ impl EditorView {
         );
         ui.separator();
 
-        inspector_section(ui, "Projeto", !self.loaded, |ui| {
-            self.draw_project_section(ui, action)
-        });
-        ui.add_enabled_ui(self.loaded, |ui| {
+        ui.add_enabled_ui(
+            !self.loading.is_busy() && self.ui.pending_flavour.is_none(),
+            |ui| {
+                inspector_section(ui, "Projeto", !self.loaded, |ui| {
+                    self.draw_project_section(ui, action)
+                });
+            },
+        );
+        ui.add_enabled_ui(self.loaded && !self.loading.is_project_loading(), |ui| {
             inspector_section(ui, "Seleção", true, |ui| {
                 self.draw_selection_section(ui, visual_changed)
             });
@@ -2011,6 +1962,11 @@ impl EditorView {
     }
 
     fn apply(&mut self, action: EditorAction) {
+        if self.loading.is_project_loading()
+            && !matches!(action, EditorAction::None | EditorAction::OpenProject)
+        {
+            return;
+        }
         let bx = self.ui.selected.x / 8;
         let by = self.ui.selected.y / 8;
         if !matches!(action, EditorAction::None | EditorAction::OpenProject)
@@ -2216,99 +2172,6 @@ impl EditorView {
             .map(|region| self.ui.map_type.package_name(&region))
     }
 
-    fn open_project(&mut self) {
-        let client_text = self.ui.client_root.trim();
-        if client_text.is_empty() {
-            self.ui.status = "Informe a pasta raiz do cliente Lineage II.".into();
-            return;
-        }
-        let client_root = PathBuf::from(client_text);
-        if !client_root.is_dir() {
-            self.ui.status = format!("Pasta de cliente inválida: {}", client_root.display());
-            return;
-        }
-        let geodata_text = self.ui.open_path.trim();
-        if geodata_text.is_empty() {
-            self.ui.status = "Selecione a geodata que será editada.".into();
-            return;
-        }
-        let path = PathBuf::from(geodata_text);
-        let Some(region) = editor::geodata_region(&path) else {
-            self.ui.status = format!("Nome de geodata inválido: {}", path.display());
-            return;
-        };
-        let document = match Document::open(&path) {
-            Ok(document) => document,
-            Err(error) => {
-                self.ui.status = format!("Falha ao abrir geodata: {error}");
-                return;
-            }
-        };
-        let loader = PackageLoader::new(client_root, 0, false);
-        let package = match map_package_or_prompt(&loader, &region, self.ui.map_type) {
-            Ok(package) => package,
-            Err(Some(pending)) => {
-                // Ask in-app and come back through this same method once the
-                // user answers.
-                self.ui.status = pending.question();
-                self.ui.pending_flavour = Some(pending);
-                return;
-            }
-            Err(None) => {
-                let missing = self.ui.map_type.package_name(&region);
-                self.ui.status = format!("O mapa {missing} não existe no cliente informado.");
-                return;
-            }
-        };
-        self.ui.pending_flavour = None;
-        let source_map = match loader.load_map(&package) {
-            Ok(source_map) => source_map,
-            Err(error) => {
-                self.ui.status = format!("Falha ao carregar Maps/{package}.unr: {error}");
-                return;
-            }
-        };
-        self.package_count = loader.loaded_package_count();
-        self.document = document;
-        self.max_layer_count = self.document.max_layer_count().max(1);
-        self.ui.visible_layer = self
-            .ui
-            .visible_layer
-            .min(self.max_layer_count.saturating_sub(1));
-        self.ui.selected.layer = self.ui.visible_layer;
-        self.preview.source_map = source_map;
-        self.preview.collision_meshes = CollisionMeshes::new(
-            &self.preview.device,
-            &self.preview.source_map,
-            map_origin(self.preview.source_map.bounds),
-        );
-        self.preview.camera.reset(self.preview.source_map.bounds);
-        // Only now that `source_map` is the newly loaded map: the textured
-        // scene is rebased onto `map_origin(source_map.bounds)`, so building
-        // it any earlier anchors it to the previous map's centre and puts it
-        // tens of thousands of units away from the camera.
-        self.textured_scene = None;
-        if self.ui.textured_view {
-            self.apply_visual_scene(&loader, &package);
-        }
-        self.loaded = true;
-        self.has_context = true;
-
-        self.ui.selection.clear();
-        self.ui.selection_hidden = false;
-        self.ui.height_input_address = None;
-        self.ui.status = format!(
-            "Projeto carregado: {} com {} pacotes de contexto.",
-            self.preview.source_map.name, self.package_count
-        );
-        self.refresh_geodata();
-        if let Err(error) = self.persist_memory() {
-            self.ui
-                .status
-                .push_str(&format!(" Aviso: memória não salva: {error}"));
-        }
-    }
-
     fn save_opened_file(&mut self) {
         if !self.loaded || !self.has_context {
             self.ui.status = "Carregue um projeto antes de salvar.".into();
@@ -2375,27 +2238,13 @@ impl EditorView {
     }
 
     fn refresh_editor_meshes(&mut self) {
-        let origin = map_origin(self.preview.source_map.bounds);
-        let active_selection = editor_active_selection(&self.ui);
-        let selection_lookup = EditorSelectionLookup::new(&self.document, &active_selection);
-        let mesh = editor_geodata_instances(
+        self.overlays.refresh(
+            &self.preview.device,
+            &self.preview.queue,
             &self.preview.source_map,
-            &self.document,
-            origin,
-            self.ui.visual_stride,
-            EditorOverlayOptions::from_ui(&self.ui),
-            &selection_lookup,
+            &mut self.document,
+            &self.ui,
         );
-        self.geodata_mesh = GeodataInstances::new(&self.preview.device, &mesh);
-        let icons = editor_nswe_icon_instances(
-            &self.preview.source_map,
-            &self.document,
-            origin,
-            self.ui.visual_stride,
-            EditorOverlayOptions::from_ui(&self.ui),
-            &selection_lookup,
-        );
-        self.nswe_icon_mesh = NsweIconInstances::new(&self.preview.device, &icons);
     }
 
     fn pick(&self) -> Option<LayerAddress> {
@@ -2547,48 +2396,6 @@ impl EditorView {
             self.ui.selection.len()
         );
         self.refresh_editor_meshes();
-    }
-
-    /// Turns the textured visualization on: builds a fresh `PackageLoader`
-    /// from the current project settings and loads/decodes/uploads its
-    /// visual scene. Heavier than opening the project (every referenced
-    /// texture is decoded), so this only runs when the toggle is enabled.
-    fn enable_textured_view(&mut self) {
-        if !self.loaded || !self.has_context {
-            self.ui.status =
-                "Carregue um projeto antes de ativar a visualização texturizada.".into();
-            self.ui.textured_view = false;
-            return;
-        }
-        let Some(package) = self.map_package() else {
-            self.ui.status = "Nome de geodata inválido para carregar texturas.".into();
-            self.ui.textured_view = false;
-            return;
-        };
-        let loader = PackageLoader::new(PathBuf::from(self.ui.client_root.trim()), 0, false);
-        self.apply_visual_scene(&loader, &package);
-    }
-
-    fn apply_visual_scene(&mut self, loader: &PackageLoader, package: &str) {
-        match loader.load_visual_scene(package) {
-            Ok(scene) => {
-                let batch_count = scene.batches.len();
-                self.textured_scene = Some(TexturedScene::new(
-                    &self.preview.device,
-                    &self.preview.queue,
-                    &self.preview.material_texture_layout,
-                    &scene,
-                    map_origin(self.preview.source_map.bounds),
-                ));
-                self.ui.status =
-                    format!("Visualização texturizada carregada: {batch_count} lote(s).");
-            }
-            Err(error) => {
-                self.textured_scene = None;
-                self.ui.textured_view = false;
-                self.ui.status = format!("Falha ao carregar visualização texturizada: {error}");
-            }
-        }
     }
 }
 fn brush_size(requested_size: usize) -> usize {
@@ -3124,18 +2931,20 @@ fn block_is_fully_open(document: &Document, block_x: usize, block_y: usize) -> b
     has_surface
 }
 
-fn editor_geodata_instances(
+fn editor_geodata_instances_in_blocks(
     map: &SourceMap,
     document: &Document,
     origin: Vec3,
     stride: usize,
     visibility: EditorOverlayOptions,
     selection: &EditorSelectionLookup,
+    block_x: Range<usize>,
+    block_y: Range<usize>,
 ) -> CpuGeodata {
     let mut mesh = CpuGeodata::default();
     let stride = stride.max(1);
-    for block_x in 0..256 {
-        for block_y in 0..256 {
+    for block_x in block_x {
+        for block_y in block_y.clone() {
             let start_x = block_x * 8;
             let start_y = block_y * 8;
             if visibility.hides_block(document, block_x, block_y) {
@@ -3211,18 +3020,20 @@ fn editor_geodata_instances(
 /// quads.  It intentionally follows the same sampling rules as the coloured
 /// cells, so an icon always describes the quad below it.  Partial and blocked
 /// columns are never sampled away.
-fn editor_nswe_icon_instances(
+fn editor_nswe_icon_instances_in_blocks(
     map: &SourceMap,
     document: &Document,
     origin: Vec3,
     stride: usize,
     visibility: EditorOverlayOptions,
     selection: &EditorSelectionLookup,
+    block_x: Range<usize>,
+    block_y: Range<usize>,
 ) -> CpuNsweIcons {
     let mut mesh = CpuNsweIcons::default();
     let stride = stride.max(1);
-    for block_x in 0..256 {
-        for block_y in 0..256 {
+    for block_x in block_x {
+        for block_y in block_y.clone() {
             let start_x = block_x * 8;
             let start_y = block_y * 8;
             if visibility.hides_block(document, block_x, block_y) {
@@ -3640,65 +3451,6 @@ struct CpuGeodata {
     instances: Vec<GeodataInstance>,
 }
 
-struct GeodataInstances {
-    quad_vertices: wgpu::Buffer,
-    triangles: wgpu::Buffer,
-    lines: wgpu::Buffer,
-    instances: wgpu::Buffer,
-    count: u32,
-}
-
-impl GeodataInstances {
-    fn new(device: &wgpu::Device, mesh: &CpuGeodata) -> Self {
-        const QUAD_VERTICES: [QuadVertex; 4] = [
-            QuadVertex {
-                offset: [-1.0, -1.0],
-            },
-            QuadVertex {
-                offset: [1.0, -1.0],
-            },
-            QuadVertex {
-                offset: [-1.0, 1.0],
-            },
-            QuadVertex { offset: [1.0, 1.0] },
-        ];
-        const TRIANGLES: [u16; 6] = [0, 2, 1, 1, 2, 3];
-        const LINES: [u16; 8] = [0, 1, 1, 3, 3, 2, 2, 0];
-        let instances = if mesh.instances.is_empty() {
-            vec![GeodataInstance {
-                position: [0.0; 3],
-                scale: 0.0,
-                color: [0; 4],
-            }]
-        } else {
-            mesh.instances.clone()
-        };
-        Self {
-            quad_vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("geodata-quad-vertices"),
-                contents: bytemuck::cast_slice(&QUAD_VERTICES),
-                usage: wgpu::BufferUsages::VERTEX,
-            }),
-            triangles: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("geodata-quad-triangles"),
-                contents: bytemuck::cast_slice(&TRIANGLES),
-                usage: wgpu::BufferUsages::INDEX,
-            }),
-            lines: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("geodata-quad-lines"),
-                contents: bytemuck::cast_slice(&LINES),
-                usage: wgpu::BufferUsages::INDEX,
-            }),
-            instances: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("geodata-instances"),
-                contents: bytemuck::cast_slice(&instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            }),
-            count: mesh.instances.len() as u32,
-        }
-    }
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct NsweIconInstance {
@@ -3726,58 +3478,6 @@ impl NsweIconInstance {
 #[derive(Default)]
 struct CpuNsweIcons {
     instances: Vec<NsweIconInstance>,
-}
-
-struct NsweIconInstances {
-    quad_vertices: wgpu::Buffer,
-    triangles: wgpu::Buffer,
-    instances: wgpu::Buffer,
-    count: u32,
-}
-
-impl NsweIconInstances {
-    fn new(device: &wgpu::Device, mesh: &CpuNsweIcons) -> Self {
-        const QUAD_VERTICES: [QuadVertex; 4] = [
-            QuadVertex {
-                offset: [-1.0, -1.0],
-            },
-            QuadVertex {
-                offset: [1.0, -1.0],
-            },
-            QuadVertex {
-                offset: [-1.0, 1.0],
-            },
-            QuadVertex { offset: [1.0, 1.0] },
-        ];
-        const TRIANGLES: [u16; 6] = [0, 2, 1, 1, 2, 3];
-        let instances = if mesh.instances.is_empty() {
-            vec![NsweIconInstance {
-                position: [0.0; 3],
-                scale: 0.0,
-                mask: 0.0,
-            }]
-        } else {
-            mesh.instances.clone()
-        };
-        Self {
-            quad_vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("editor-nswe-icon-quad-vertices"),
-                contents: bytemuck::cast_slice(&QUAD_VERTICES),
-                usage: wgpu::BufferUsages::VERTEX,
-            }),
-            triangles: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("editor-nswe-icon-quad-triangles"),
-                contents: bytemuck::cast_slice(&TRIANGLES),
-                usage: wgpu::BufferUsages::INDEX,
-            }),
-            instances: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("editor-nswe-icon-instances"),
-                contents: bytemuck::cast_slice(&instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            }),
-            count: mesh.instances.len() as u32,
-        }
-    }
 }
 
 struct CollisionMeshes {
@@ -3852,58 +3552,6 @@ struct TexturedScene {
 }
 
 impl TexturedScene {
-    fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        material_layout: &wgpu::BindGroupLayout,
-        scene: &VisualScene,
-        origin: Vec3,
-    ) -> Self {
-        let batches = scene
-            .batches
-            .iter()
-            .filter(|batch| !batch.indices.is_empty())
-            .map(|batch| {
-                let vertices = textured_batch_vertices(batch, origin);
-                let material = match &batch.texture {
-                    Some(texture) if texture.width > 0 && texture.height > 0 => {
-                        create_material_bind_group(
-                            device,
-                            queue,
-                            material_layout,
-                            texture.width,
-                            texture.height,
-                            &texture.rgba,
-                        )
-                    }
-                    _ => create_material_bind_group(
-                        device,
-                        queue,
-                        material_layout,
-                        1,
-                        1,
-                        &FALLBACK_MATERIAL_RGBA,
-                    ),
-                };
-                TexturedBatch {
-                    vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("editor-textured-batch-vertices"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                    indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("editor-textured-batch-indices"),
-                        contents: bytemuck::cast_slice(&batch.indices),
-                        usage: wgpu::BufferUsages::INDEX,
-                    }),
-                    index_count: batch.indices.len() as u32,
-                    material,
-                }
-            })
-            .collect();
-        Self { batches }
-    }
-
     fn draw<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
@@ -3997,50 +3645,6 @@ fn draw_mesh<'a>(
         wgpu::IndexFormat::Uint32,
     );
     pass.draw_indexed(0..count, 0, 0..1);
-}
-
-fn draw_geodata<'a>(
-    pass: &mut wgpu::RenderPass<'a>,
-    pipeline: &'a wgpu::RenderPipeline,
-    mesh: &'a GeodataInstances,
-    camera: &'a wgpu::BindGroup,
-    lines: bool,
-) {
-    if mesh.count == 0 {
-        return;
-    }
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, camera, &[]);
-    pass.set_vertex_buffer(0, mesh.quad_vertices.slice(..));
-    pass.set_vertex_buffer(1, mesh.instances.slice(..));
-    pass.set_index_buffer(
-        if lines {
-            mesh.lines.slice(..)
-        } else {
-            mesh.triangles.slice(..)
-        },
-        wgpu::IndexFormat::Uint16,
-    );
-    pass.draw_indexed(if lines { 0..8 } else { 0..6 }, 0, 0..mesh.count);
-}
-
-fn draw_nswe_icons<'a>(
-    pass: &mut wgpu::RenderPass<'a>,
-    pipeline: &'a wgpu::RenderPipeline,
-    mesh: &'a NsweIconInstances,
-    camera: &'a wgpu::BindGroup,
-    atlas: &'a wgpu::BindGroup,
-) {
-    if mesh.count == 0 {
-        return;
-    }
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, camera, &[]);
-    pass.set_bind_group(1, atlas, &[]);
-    pass.set_vertex_buffer(0, mesh.quad_vertices.slice(..));
-    pass.set_vertex_buffer(1, mesh.instances.slice(..));
-    pass.set_index_buffer(mesh.triangles.slice(..), wgpu::IndexFormat::Uint16);
-    pass.draw_indexed(0..6, 0, 0..mesh.count);
 }
 
 #[repr(C)]
@@ -4728,14 +4332,7 @@ fn create_material_bind_group(
     height: u32,
     rgba: &[u8],
 ) -> wgpu::BindGroup {
-    let mut mips = vec![(width, height, rgba.to_vec())];
-    while {
-        let (level_width, level_height, _) = mips.last().unwrap();
-        *level_width > 1 || *level_height > 1
-    } {
-        let (level_width, level_height, level_rgba) = mips.last().unwrap();
-        mips.push(downsample_rgba(*level_width, *level_height, level_rgba));
-    }
+    let mip_level_count = u32::BITS - width.max(height).leading_zeros();
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("editor-material-texture"),
         size: wgpu::Extent3d {
@@ -4743,33 +4340,42 @@ fn create_material_bind_group(
             height,
             depth_or_array_layers: 1,
         },
-        mip_level_count: mips.len() as u32,
+        mip_level_count,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    for (level, (level_width, level_height, level_rgba)) in mips.iter().enumerate() {
+    let (mut level_width, mut level_height) = (width, height);
+    let mut level_rgba = Cow::Borrowed(rgba);
+    for level in 0..mip_level_count {
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &texture,
-                mip_level: level as u32,
+                mip_level: level,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            level_rgba,
+            &level_rgba,
             wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * level_width),
-                rows_per_image: Some(*level_height),
+                rows_per_image: Some(level_height),
             },
             wgpu::Extent3d {
-                width: *level_width,
-                height: *level_height,
+                width: level_width,
+                height: level_height,
                 depth_or_array_layers: 1,
             },
         );
+        if level + 1 < mip_level_count {
+            let (next_width, next_height, next_rgba) =
+                downsample_rgba(level_width, level_height, &level_rgba);
+            level_width = next_width;
+            level_height = next_height;
+            level_rgba = Cow::Owned(next_rgba);
+        }
     }
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -5801,19 +5407,11 @@ mod tests {
         let input = std::env::var("GEODATA_EDITOR_L2J").expect("set GEODATA_EDITOR_L2J");
         let region = editor::geodata_region(Path::new(&input)).expect("region of the geodata");
         for map_type in MapType::ALL {
-            let options = EditorOptions {
-                input: Some(PathBuf::from(&input)),
-                client_root: Some(PathBuf::from(&root)),
-                map_type: Some(map_type),
-            };
-            let (source_map, packages, pending) =
-                editor_source_map(&options).expect("load the client package");
+            let loader = PackageLoader::new(PathBuf::from(&root), 0, false);
+            let package = map_package_or_prompt(&loader, &region, map_type)
+                .expect("both map flavours exist for this region");
+            let source_map = loader.load_map(&package).expect("load the client package");
             assert_eq!(source_map.name, map_type.package_name(&region));
-            assert!(packages > 0);
-            assert_eq!(
-                pending, None,
-                "both flavours exist for this region, so nothing should be asked"
-            );
         }
     }
 
@@ -5966,20 +5564,6 @@ mod tests {
             editor_cell_color(Layer { height: 0, nswe: 0 }, true),
             [255, 235, 0, 255]
         );
-    }
-    #[test]
-    fn hidden_selection_has_no_active_cells() {
-        let mut ui = EditorUi {
-            selected: LayerAddress::new(12, 34, 0),
-            ..Default::default()
-        };
-        assert_eq!(editor_active_selection(&ui), vec![ui.selected]);
-        assert_eq!(editor_active_selection_count(&ui), 1);
-
-        ui.selection_hidden = true;
-
-        assert!(editor_active_selection(&ui).is_empty());
-        assert_eq!(editor_active_selection_count(&ui), 0);
     }
 
     #[test]

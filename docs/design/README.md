@@ -33,6 +33,12 @@ inside their fields and expose the full value on hover. The inspector resizes
 and scrolls; viewport controls scroll horizontally when space is constrained.
 Empty-project editing controls are disabled. The light theme remains available.
 
+Project decoding, collision buffers, initial overlays and textured resources are
+prepared in `src/editor_view/loading.rs` on a worker thread. The current scene
+remains visible until the replacement is ready. `src/editor_view/overlays.rs`
+owns the 16×16-block chunk cache: local changes reuse unaffected buffers, global
+filters regenerate all chunks, and hidden NSWE glyphs are rebuilt lazily.
+
 The camera projection and picking share the same viewport rectangle, excluding
 the menus, inspector and status bar. Unit tests cover the coordinate mapping at
 100%, 125% and 200% scale and a surface smaller than its panels.
