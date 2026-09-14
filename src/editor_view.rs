@@ -1992,7 +1992,7 @@ impl EditorView {
                 ui.separator();
                 ui.label(format!("ALTERADOS: {}", self.document.changed_blocks()));
                 ui.separator();
-                ui.monospace(format!("CÂMERA: {camera_x}, {camera_y}, {camera_z}"));
+                ui.monospace(format!("CÂMERA: {camera_x} {camera_y} {camera_z}"));
             },
         );
         ui.separator();
