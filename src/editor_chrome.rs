@@ -6,15 +6,22 @@ use crate::{editor::EditorTheme, l2j::Direction};
 
 pub(super) fn background(theme: EditorTheme) -> Color32 {
     match theme {
-        EditorTheme::Dark => Color32::from_rgb(23, 25, 29),
+        EditorTheme::Dark => Color32::from_gray(20),
         EditorTheme::Light => Color32::from_rgb(234, 237, 241),
     }
 }
 
 pub(super) fn accent(theme: EditorTheme) -> Color32 {
     match theme {
-        EditorTheme::Dark => Color32::from_rgb(74, 158, 255),
+        EditorTheme::Dark => Color32::from_rgb(0, 112, 224),
         EditorTheme::Light => Color32::from_rgb(24, 101, 191),
+    }
+}
+
+pub(super) fn toolbar_background(theme: EditorTheme) -> Color32 {
+    match theme {
+        EditorTheme::Dark => Color32::from_gray(36),
+        EditorTheme::Light => Color32::from_rgb(247, 248, 250),
     }
 }
 
@@ -28,34 +35,44 @@ pub(super) fn apply_theme(context: &egui::Context, theme: EditorTheme) {
     };
     let rgb = Color32::from_rgb;
     let panel = if dark {
-        rgb(34, 37, 43)
+        Color32::from_gray(26)
     } else {
         rgb(247, 248, 250)
     };
     let border = if dark {
-        rgb(54, 59, 68)
+        Color32::from_gray(16)
     } else {
         rgb(200, 207, 217)
     };
     let text = if dark {
-        rgb(222, 226, 233)
+        Color32::from_gray(192)
     } else {
         rgb(38, 46, 57)
     };
     style.visuals.panel_fill = panel;
-    style.visuals.window_fill = panel;
+    style.visuals.window_fill = if dark { Color32::from_gray(56) } else { panel };
     style.visuals.extreme_bg_color = background(theme);
     style.visuals.faint_bg_color = if dark {
-        rgb(39, 43, 50)
+        Color32::from_gray(43)
     } else {
         rgb(229, 234, 241)
     };
     style.visuals.selection.bg_fill = if dark {
-        rgb(35, 73, 118)
+        rgb(62, 95, 119)
     } else {
         rgb(202, 225, 252)
     };
-    style.visuals.selection.stroke = Stroke::new(1.0_f32, accent(theme));
+    style.visuals.selection.stroke = Stroke::new(
+        1.0_f32,
+        if dark {
+            Color32::from_gray(217)
+        } else {
+            accent(theme)
+        },
+    );
+    if dark {
+        style.visuals.hyperlink_color = accent(theme);
+    }
     style.visuals.window_stroke = Stroke::new(1.0_f32, border);
     style.visuals.window_rounding = 4.0.into();
     style.visuals.menu_rounding = 4.0.into();
@@ -66,7 +83,7 @@ pub(super) fn apply_theme(context: &egui::Context, theme: EditorTheme) {
         (
             &mut style.visuals.widgets.inactive,
             if dark {
-                rgb(46, 50, 58)
+                Color32::from_gray(38)
             } else {
                 rgb(229, 234, 241)
             },
@@ -74,7 +91,7 @@ pub(super) fn apply_theme(context: &egui::Context, theme: EditorTheme) {
         (
             &mut style.visuals.widgets.hovered,
             if dark {
-                rgb(62, 70, 82)
+                Color32::from_gray(63)
             } else {
                 rgb(215, 228, 245)
             },
@@ -82,7 +99,7 @@ pub(super) fn apply_theme(context: &egui::Context, theme: EditorTheme) {
         (
             &mut style.visuals.widgets.active,
             if dark {
-                rgb(39, 79, 128)
+                Color32::from_gray(75)
             } else {
                 rgb(194, 217, 247)
             },
@@ -96,8 +113,14 @@ pub(super) fn apply_theme(context: &egui::Context, theme: EditorTheme) {
         widget.expansion = 0.0;
     }
     style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent(theme));
-    style.visuals.widgets.hovered.bg_stroke =
-        Stroke::new(1.0_f32, accent(theme).gamma_multiply(0.7));
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(
+        1.0_f32,
+        if dark {
+            Color32::from_gray(80)
+        } else {
+            accent(theme).gamma_multiply(0.7)
+        },
+    );
     style.spacing.item_spacing = egui::vec2(8.0, 7.0);
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
     style.spacing.interact_size = egui::vec2(64.0, 26.0);
@@ -304,8 +327,20 @@ pub(super) fn toggle(ui: &mut Ui, icon: Icon, label: &str, value: &mut bool) -> 
 
 pub(super) fn primary_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     ui.scope(|ui| {
-        ui.visuals_mut().selection.bg_fill = Color32::from_rgb(27, 105, 194);
-        ui.visuals_mut().selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(86, 165, 255));
+        let dark = ui.visuals().dark_mode;
+        ui.visuals_mut().selection.bg_fill = if dark {
+            accent(EditorTheme::Dark)
+        } else {
+            Color32::from_rgb(27, 105, 194)
+        };
+        ui.visuals_mut().selection.stroke = Stroke::new(
+            1.0_f32,
+            if dark {
+                Color32::WHITE
+            } else {
+                Color32::from_rgb(86, 165, 255)
+            },
+        );
         ui.visuals_mut().widgets.active.fg_stroke.color = Color32::WHITE;
         icon_button(ui, icon, label, true)
     })

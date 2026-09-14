@@ -1175,6 +1175,10 @@ impl EditorView {
             .show(context, |ui| self.draw_editor_menu(ui, &mut action));
         egui::TopBottomPanel::top("editor_toolbar")
             .exact_height(46.0)
+            .frame(
+                egui::Frame::side_top_panel(&context.style())
+                    .fill(chrome::toolbar_background(self.ui.theme)),
+            )
             .show(context, |ui| self.draw_editor_toolbar(ui, &mut action));
         egui::TopBottomPanel::bottom("editor_status")
             .exact_height(56.0)
@@ -1214,6 +1218,10 @@ impl EditorView {
             });
         egui::TopBottomPanel::top("editor_viewport_toolbar")
             .exact_height(36.0)
+            .frame(
+                egui::Frame::side_top_panel(&context.style())
+                    .fill(chrome::toolbar_background(self.ui.theme)),
+            )
             .show(context, |ui| {
                 egui::ScrollArea::horizontal()
                     .id_source("viewport_controls")
@@ -2743,7 +2751,7 @@ fn theme_accent(theme: EditorTheme) -> egui::Color32 {
 /// Secondary text for status messages and supporting details.
 fn theme_muted_color(theme: EditorTheme) -> egui::Color32 {
     match theme {
-        EditorTheme::Dark => egui::Color32::from_rgb(190, 200, 210),
+        EditorTheme::Dark => egui::Color32::from_gray(160),
         EditorTheme::Light => egui::Color32::from_rgb(95, 100, 108),
     }
 }

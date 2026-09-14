@@ -8,15 +8,22 @@ See [the generated concept](higgsfield-reference.png) and
 The Unreal Engine 5 inspiration is expressed through compact toolbars, graphite
 surfaces, restrained blue selection, square-edged controls and a dominant 3D
 viewport. The implementation remains native Rust/egui/wgpu.
+The dark palette follows the supplied Unreal Engine 5 screenshot: neutral Slate
+surfaces, lighter menus and muted blue selections. The light theme and semantic
+geodata/NSWE colors remain unchanged.
 
 | Role | Dark theme |
 | --- | --- |
-| Recessed surface | `#17191D` |
-| Panel | `#22252B` |
-| Input / inactive button | `#2E323A` |
-| Divider | `#363B44` |
-| Primary text | `#DEE2E9` |
-| Active accent | `#4A9EFF` |
+| Recessed surface / input | `#141414` |
+| Panel | `#1A1A1A` |
+| Toolbar | `#242424` |
+| Inspector section | `#2B2B2B` |
+| Menu / floating window | `#383838` |
+| Inactive button | `#262626` |
+| Divider | `#101010` |
+| Primary text | `#C0C0C0` |
+| Selected background | `#3E5F77` |
+| Active accent | `#0070E0` |
 
 Typography uses the bundled egui proportional font at 13 px for controls and
 body text, 11 px for supporting text, and a 12 px monospace face for telemetry.
