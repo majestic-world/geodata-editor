@@ -46,6 +46,14 @@ pipeline variants and shared bitmap uploads are prepared on the same worker.
 BSP visual visibility is independent of collision passability; invisible faces
 and zone/sky portals are not rendered as ordinary textured polygons.
 
+Texture uploads share a 16 MiB staging admission budget, accounting for padded
+rows across every mip level. An oversized individual upload runs alone; a final
+fence completes all pending uploads before publishing the scene.
+Rebased batch bounds support conservative view-frustum rejection. Visible draw
+order is cached until the camera/projection changes, preserving opaque-first and
+back-to-front transparent order without rebuilding geometry or allocating per
+frame. Adjacent draws reuse unchanged pipeline/material bindings.
+
 The camera projection and picking share the same viewport rectangle, excluding
 the menus, inspector and status bar. Unit tests cover the coordinate mapping at
 100%, 125% and 200% scale and a surface smaller than its panels.

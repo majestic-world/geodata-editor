@@ -1,6 +1,7 @@
 //! Background project decoding and GPU preparation; only completed resources reach the UI.
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     path::PathBuf,
     sync::{
@@ -414,6 +415,35 @@ fn finish_upload_batch(device: &wgpu::Device, queue: &wgpu::Queue) {
     device.poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
 }
 
+// 16 MiB amortizes queue fences while keeping pending upload staging small.
+// One indivisible texture or buffer may exceed it, but starts in an empty batch.
+const UPLOAD_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+
+fn reserve_upload_bytes(pending: &Cell<u64>, bytes: u64, flush: impl FnOnce()) {
+    let mut current = pending.get();
+    if current > 0 && bytes > UPLOAD_BATCH_BYTES.saturating_sub(current) {
+        flush();
+        current = 0;
+    }
+    pending.set(current + bytes);
+}
+
+fn material_texture_upload_bytes(mut width: u32, mut height: u32) -> u64 {
+    let mut bytes = 0;
+    loop {
+        // write_texture pads staging rows to the backend's copy pitch. Use the
+        // portable 256-byte alignment conservatively, including every small mip.
+        let row_bytes = u64::from(width) * 4;
+        let alignment = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        bytes += row_bytes.div_ceil(alignment) * alignment * u64::from(height);
+        if width == 1 && height == 1 {
+            return bytes;
+        }
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
+}
+
 impl TexturedScene {
     pub(super) fn new(
         device: &wgpu::Device,
@@ -423,6 +453,7 @@ impl TexturedScene {
         scene: &VisualScene,
         origin: Vec3,
     ) -> Self {
+        let pending_upload_bytes = Cell::new(0);
         let mut textures = HashMap::new();
         let sampler = create_material_sampler(device);
         let texture_key = |texture: Option<&VisualTexture>| {
@@ -434,6 +465,11 @@ impl TexturedScene {
                     .map_or((1, 1, FALLBACK_MATERIAL_RGBA.as_slice()), |texture| {
                         (texture.width, texture.height, texture.rgba.as_ref())
                     });
+                reserve_upload_bytes(
+                    &pending_upload_bytes,
+                    material_texture_upload_bytes(width, height),
+                    || finish_upload_batch(device, queue),
+                );
                 Arc::new(create_material_texture(device, queue, width, height, rgba))
             }))
         };
@@ -442,6 +478,8 @@ impl TexturedScene {
         let mut prepared = Self {
             batches: Vec::with_capacity(scene.batches.len()),
             pipelines: Vec::new(),
+            visible_order: Vec::with_capacity(scene.batches.len()),
+            view_projection: None,
             opaque_order: Vec::new(),
             blended_order: Vec::new(),
             sort_direction: None,
@@ -484,39 +522,49 @@ impl TexturedScene {
             }));
             let vertices = textured_batch_vertices(batch, origin);
             let index = prepared.batches.len();
-            let center = if state.blend == VisualBlend::Opaque {
+            if state.blend == VisualBlend::Opaque {
                 prepared.opaque_order.push(index);
-                [0.0; 3]
             } else {
                 prepared.blended_order.push((index, 0.0));
-                let mut min = [f32::INFINITY; 3];
-                let mut max = [f32::NEG_INFINITY; 3];
-                for vertex in &vertices {
-                    for axis in 0..3 {
-                        min[axis] = min[axis].min(vertex.position[axis]);
-                        max[axis] = max[axis].max(vertex.position[axis]);
-                    }
+            }
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for vertex in &vertices {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(vertex.position[axis]);
+                    max[axis] = max[axis].max(vertex.position[axis]);
                 }
-                std::array::from_fn(|axis| (min[axis] + max[axis]) * 0.5)
-            };
+            }
+            let center = std::array::from_fn(|axis| (min[axis] + max[axis]) * 0.5);
+            let vertex_bytes = bytemuck::cast_slice(&vertices);
+            reserve_upload_bytes(&pending_upload_bytes, vertex_bytes.len() as u64, || {
+                finish_upload_batch(device, queue);
+            });
+            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("editor-textured-batch-vertices"),
+                contents: vertex_bytes,
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_bytes = bytemuck::cast_slice(&batch.indices);
+            reserve_upload_bytes(&pending_upload_bytes, index_bytes.len() as u64, || {
+                finish_upload_batch(device, queue);
+            });
+            let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("editor-textured-batch-indices"),
+                contents: index_bytes,
+                usage: wgpu::BufferUsages::INDEX,
+            });
             prepared.batches.push(TexturedBatch {
-                vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("editor-textured-batch-vertices"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("editor-textured-batch-indices"),
-                    contents: bytemuck::cast_slice(&batch.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
+                vertices: vertex_buffer,
+                indices: index_buffer,
                 index_count: batch.indices.len() as u32,
                 material,
                 pipeline,
                 center,
+                bounds: [min, max],
             });
-            finish_upload_batch(device, queue);
         }
+        finish_upload_batch(device, queue);
         prepared
     }
 }
@@ -524,6 +572,7 @@ impl TexturedScene {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         path::PathBuf,
         sync::{Arc, mpsc},
         thread,
@@ -532,7 +581,7 @@ mod tests {
 
     use super::{
         ActiveJob, Completion, GpuContext, Job, LoadingState, ProjectOutcome, ProjectSettings,
-        prepare_project,
+        UPLOAD_BATCH_BYTES, material_texture_upload_bytes, prepare_project, reserve_upload_bytes,
     };
     use crate::{
         editor::{self, MapType},
@@ -542,6 +591,26 @@ mod tests {
         },
         l2j::Document,
     };
+
+    #[test]
+    fn upload_admission_flushes_before_overflow_and_isolates_oversized_uploads() {
+        let pending = Cell::new(0);
+        let mut flushed = Vec::new();
+        for bytes in [UPLOAD_BATCH_BYTES - 4, 4, 4, UPLOAD_BATCH_BYTES + 4, 4] {
+            reserve_upload_bytes(&pending, bytes, || flushed.push(pending.get()));
+            assert!(pending.get() <= UPLOAD_BATCH_BYTES.max(bytes));
+        }
+        assert_eq!(flushed, [UPLOAD_BATCH_BYTES, 4, UPLOAD_BATCH_BYTES + 4]);
+        assert_eq!(pending.get(), 4);
+    }
+
+    #[test]
+    fn texture_upload_budget_includes_small_and_non_square_mips() {
+        // The fallback still needs one staging row; a 17x3 texture has mip
+        // heights 3, 1, 1, 1, 1, all narrower than one portable copy pitch.
+        assert_eq!(material_texture_upload_bytes(1, 1), 256);
+        assert_eq!(material_texture_upload_bytes(17, 3), 7 * 256);
+    }
 
     fn wait_for_completion(state: &mut LoadingState) -> Completion {
         let started = Instant::now();

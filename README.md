@@ -45,6 +45,13 @@ O carregamento do projeto e das texturas ocorre em segundo plano. A cena atual
 permanece visível até a substituição estar pronta; a edição fica bloqueada durante
 a troca de projeto. A primeira ativação de texturas prepara os materiais, e as
 ativações seguintes reutilizam a cena carregada.
+Os uploads são agrupados com um orçamento de 16 MiB de memória temporária,
+em vez de esperar a GPU após cada material. Lotes texturizados completamente
+fora do campo de visão não são enviados para desenho; isso não reduz os detalhes
+visíveis nem altera as texturas.
+
+Para uso normal, execute `dist/GeodataEditor.exe`, gerado por `make build`.
+O executável de `target/debug` prioriza depuração e pode ser bem mais lento.
 
 Materiais opacos ignoram o alpha usado para especularidade. Materiais mascarados
 respeitam o `AlphaRef` do cliente; opacidade separada e modos de composição são

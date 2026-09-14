@@ -1063,7 +1063,7 @@ impl EditorView {
         );
         if self.ui.textured_view {
             if let Some(scene) = &mut self.textured_scene {
-                scene.sort_blended(self.preview.camera.forward());
+                scene.update_view(&uniform.view_projection, self.preview.camera.forward());
             }
         }
         {
@@ -3537,6 +3537,7 @@ struct TexturedBatch {
     material: Arc<wgpu::BindGroup>,
     pipeline: usize,
     center: [f32; 3],
+    bounds: [[f32; 3]; 2],
 }
 
 /// GPU-resident form of `unreal::VisualScene`, built once when the textured
@@ -3544,12 +3545,31 @@ struct TexturedBatch {
 struct TexturedScene {
     batches: Vec<TexturedBatch>,
     pipelines: Vec<wgpu::RenderPipeline>,
+    visible_order: Vec<usize>,
+    view_projection: Option<[[f32; 4]; 4]>,
     opaque_order: Vec<usize>,
     blended_order: Vec<(usize, f32)>,
     sort_direction: Option<[f32; 3]>,
 }
 
 impl TexturedScene {
+    fn update_view(&mut self, matrix: &[[f32; 4]; 4], forward: [f32; 3]) {
+        if self.view_projection == Some(*matrix) && self.sort_direction == Some(forward) {
+            return;
+        }
+        self.sort_blended(forward);
+        self.view_projection = Some(*matrix);
+        let frustum = ViewFrustum::new(matrix);
+        self.visible_order.clear();
+        self.visible_order.extend(
+            self.opaque_order
+                .iter()
+                .copied()
+                .chain(self.blended_order.iter().map(|(index, _)| *index))
+                .filter(|index| frustum.intersects(self.batches[*index].bounds)),
+        );
+    }
+
     fn sort_blended(&mut self, forward: [f32; 3]) {
         if self.sort_direction == Some(forward) {
             return;
@@ -3566,23 +3586,63 @@ impl TexturedScene {
 
     fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup) {
         pass.set_bind_group(0, camera, &[]);
-        let mut active_pipeline = None;
-        for index in self
-            .opaque_order
-            .iter()
-            .copied()
-            .chain(self.blended_order.iter().map(|(index, _)| *index))
-        {
-            let batch = &self.batches[index];
-            if active_pipeline != Some(batch.pipeline) {
+        let mut pipeline = None;
+        let mut material: Option<&Arc<wgpu::BindGroup>> = None;
+        for index in &self.visible_order {
+            let batch = &self.batches[*index];
+            if pipeline != Some(batch.pipeline) {
                 pass.set_pipeline(&self.pipelines[batch.pipeline]);
-                active_pipeline = Some(batch.pipeline);
+                pipeline = Some(batch.pipeline);
             }
-            pass.set_bind_group(1, &batch.material, &[]);
+            if material.is_none_or(|previous| !Arc::ptr_eq(previous, &batch.material)) {
+                pass.set_bind_group(1, &batch.material, &[]);
+                material = Some(&batch.material);
+            }
             pass.set_vertex_buffer(0, batch.vertices.slice(..));
             pass.set_index_buffer(batch.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..batch.index_count, 0, 0..1);
         }
+    }
+}
+
+struct ViewFrustum {
+    planes: [[f32; 4]; 6],
+}
+
+impl ViewFrustum {
+    fn new(matrix: &[[f32; 4]; 4]) -> Self {
+        let row = |r: usize| std::array::from_fn::<_, 4, _>(|c| matrix[c][r]);
+        let x = row(0);
+        let y = row(1);
+        let z = row(2);
+        let w = row(3);
+        Self {
+            planes: [
+                std::array::from_fn(|i| w[i] + x[i]),
+                std::array::from_fn(|i| w[i] - x[i]),
+                std::array::from_fn(|i| w[i] + y[i]),
+                std::array::from_fn(|i| w[i] - y[i]),
+                z, // wgpu's near clip plane is z >= 0, not z >= -w.
+                std::array::from_fn(|i| w[i] - z[i]),
+            ],
+        }
+    }
+
+    fn intersects(&self, bounds: [[f32; 3]; 2]) -> bool {
+        self.planes.iter().all(|plane| {
+            let mut distance = plane[3];
+            for axis in 0..3 {
+                let corner = if plane[axis] >= 0.0 {
+                    bounds[1][axis]
+                } else {
+                    bounds[0][axis]
+                };
+                distance += plane[axis] * corner;
+            }
+            // Reject only a box fully outside. Keep plane crossings, boundary
+            // contacts and non-finite data conservatively visible.
+            !(distance < -0.001)
+        })
     }
 }
 
@@ -5054,6 +5114,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn view_frustum_preserves_crossings_and_rejects_fully_outside_bounds() {
+        let frustum = ViewFrustum::new(&[
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
+        assert!(frustum.intersects([[-0.5, -0.5, 0.0], [0.5, 0.5, 1.0]]));
+        // A visible box may have its centre outside the view.
+        assert!(frustum.intersects([[-20.0, -0.5, 0.2], [0.1, 0.5, 0.8]]));
+        for axis in 0..3 {
+            let lower = if axis == 2 { 0.0 } else { -1.0 };
+            let mut min = [-0.5, -0.5, 0.2];
+            let mut max = [0.5, 0.5, 0.8];
+            min[axis] = lower - 2.0;
+            max[axis] = lower;
+            assert!(
+                frustum.intersects([min, max]),
+                "touching lower plane {axis}"
+            );
+            max[axis] = lower - 0.1;
+            assert!(
+                !frustum.intersects([min, max]),
+                "outside lower plane {axis}"
+            );
+            min[axis] = 1.0;
+            max[axis] = 3.0;
+            assert!(
+                frustum.intersects([min, max]),
+                "touching upper plane {axis}"
+            );
+            min[axis] = 1.1;
+            assert!(
+                !frustum.intersects([min, max]),
+                "outside upper plane {axis}"
+            );
+        }
+    }
+
+    #[test]
     fn viewport_picking_tracks_panel_bounds_and_display_scale() {
         let logical = egui::Rect::from_min_max(egui::pos2(0.0, 112.0), egui::pos2(1088.0, 944.0));
         for scale in [1.0, 1.25, 2.0] {
@@ -5099,6 +5199,41 @@ mod tests {
         assert_eq!(
             specular_alpha, opaque,
             "an opaque material must not turn its specularity mask into transparency"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn textured_scene_uses_updated_camera_uniform() {
+        let mut triangle = material_triangle([255; 4], 0.5, Default::default(), None);
+        for (position, _, _) in &mut triangle.vertices {
+            position.x = position.x * 0.25 - 0.5;
+            position.y *= 0.25;
+        }
+        let camera = CameraUniform::new(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            [0.0, 1000.0, 0.0],
+        );
+        let mut shifted = camera;
+        shifted.view_projection[3][0] = 1.0;
+        let (side, frames) = render_visual_frames(
+            &[VisualScene {
+                batches: vec![triangle],
+            }],
+            &[camera, shifted],
+        )
+        .expect("GPU adapter");
+        let left = ((side / 2 * side + side / 4) * 4) as usize;
+        let right = ((side / 2 * side + side * 3 / 4) * 4) as usize;
+        assert!(frames[0][left] > 100 && frames[0][right] == 0);
+        assert!(
+            frames[1][left] == 0 && frames[1][right] > 100,
+            "the existing scene must move the triangle after a camera uniform write"
         );
     }
 
@@ -5151,6 +5286,24 @@ mod tests {
         scenes: &[VisualScene],
         camera_position: [f32; 3],
     ) -> Option<(u32, Vec<u8>)> {
+        // Identity view projection: vertices are given directly in NDC.
+        let camera = CameraUniform::new(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            camera_position,
+        );
+        let (side, mut frames) = render_visual_frames(scenes, &[camera])?;
+        Some((side, frames.pop()?))
+    }
+
+    fn render_visual_frames(
+        scenes: &[VisualScene],
+        cameras: &[CameraUniform],
+    ) -> Option<(u32, Vec<Vec<u8>>)> {
         const SIDE: u32 = 64;
 
         let instance = wgpu::Instance::default();
@@ -5168,20 +5321,10 @@ mod tests {
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let camera_layout = create_camera_layout(&device);
-        // Identity view projection: vertices are given directly in NDC.
-        let camera = CameraUniform::new(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            camera_position,
-        );
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::bytes_of(&camera),
-            usage: wgpu::BufferUsages::UNIFORM,
+            contents: bytemuck::bytes_of(cameras.first()?),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -5195,7 +5338,7 @@ mod tests {
         let material_layout = create_material_texture_layout(&device);
         let resources =
             TexturedPipelineResources::new(&device, &camera_layout, &material_layout, format);
-        let scenes: Vec<_> = scenes
+        let mut scenes: Vec<_> = scenes
             .iter()
             .map(|scene| {
                 let mut scene = TexturedScene::new(
@@ -5246,61 +5389,73 @@ mod tests {
             mapped_at_creation: false,
         });
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &msaa_view,
-                    resolve_target: Some(&target_view),
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Discard,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            for scene in &scenes {
-                scene.draw(&mut pass, &camera_bind_group);
+        // Scene construction happens once; camera and visibility remain live.
+        let mut frames = Vec::with_capacity(cameras.len());
+        for camera in cameras {
+            queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(camera));
+            for scene in &mut scenes {
+                scene.update_view(&camera.view_projection, [0.0, 0.0, 1.0]);
             }
-        }
-        encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyBuffer {
-                buffer: &readback,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(SIDE * 4),
-                    rows_per_image: Some(SIDE),
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &msaa_view,
+                        resolve_target: Some(&target_view),
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Discard,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                for scene in &scenes {
+                    scene.draw(&mut pass, &camera_bind_group);
+                }
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: &target,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
                 },
-            },
-            wgpu::Extent3d {
-                width: SIDE,
-                height: SIDE,
-                depth_or_array_layers: 1,
-            },
-        );
-        queue.submit([encoder.finish()]);
+                wgpu::ImageCopyBuffer {
+                    buffer: &readback,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(SIDE * 4),
+                        rows_per_image: Some(SIDE),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: SIDE,
+                    height: SIDE,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([encoder.finish()]);
 
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let data = slice.get_mapped_range();
-        Some((SIDE, data.to_vec()))
+            let slice = readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let data = slice.get_mapped_range();
+            frames.push(data.to_vec());
+            drop(data);
+            readback.unmap();
+        }
+        Some((SIDE, frames))
     }
 
     /// Centre pixel of the default overhead-camera frame.
@@ -5408,7 +5563,6 @@ mod tests {
             &scene,
             origin,
         );
-        textured.sort_blended(camera.forward());
         // Keep batch isolation while exercising the same sorted, material-aware
         // drawing path as the interactive editor.
         let only = std::env::var("GEODATA_EDITOR_ONLY_BATCH")
@@ -5421,6 +5575,7 @@ mod tests {
             |index: usize| only.is_none_or(|wanted| wanted == index) && skip != Some(index);
         textured.opaque_order.retain(|index| visible(*index));
         textured.blended_order.retain(|(index, _)| visible(*index));
+        textured.update_view(&uniform.view_projection, camera.forward());
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
