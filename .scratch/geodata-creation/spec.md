@@ -182,7 +182,7 @@ Todas as operações novas entram no undo/redo, no contador de blocos alterados 
 
 ## Further Notes
 
-- **Verificação pendente:** não houve arquivo L2J nem cliente real disponível durante o planejamento. Ainda não se sabe como as lacunas aparecem nos arquivos reais: sentinela `NULL_HEIGHT`, camada faltando em multilayer ou célula na altura do terreno com NSWE fechado. A calibração das constantes deve medir isso, junto com a distribuição dos intervalos entre camadas consecutivas e a concordância do gerador com a geodata original numa área de referência.
+- **Dados reais para a implementação:** `C:\Users\Dev\Desktop\geodata` tem 166 arquivos `.l2j` reais (regiões `16_10` em diante). Nos testes ignorados e na calibração, aponte `GEODATA_EDITOR_L2J` para um arquivo dessa pasta (por exemplo, `17_22.l2j`). Ainda não se sabe como as lacunas aparecem nesses arquivos: sentinela `NULL_HEIGHT`, camada faltando em multilayer ou célula na altura do terreno com NSWE fechado. A calibração das constantes deve medir isso, junto com a distribuição dos intervalos entre camadas consecutivas e a concordância do gerador com a geodata original numa área de referência. Para a amostragem de colisão ainda é preciso apontar `GEODATA_EDITOR_CLIENT` para um cliente.
 - **Risco:** GeoEngines do lado do servidor podem ter limite de camadas por coluna menor que 255 ou exigir um intervalo mínimo próprio. Vale validar um arquivo gerado num servidor de teste.
 - **Risco:** o NSWE automático depende da qualidade da colisão (BSP, blocking volumes). Por isso é uma categoria opcional na prévia.
 - **Risco:** ainda falta medir memória e tempo do índice espacial numa região densa. Ele é montado no worker de carregamento.
